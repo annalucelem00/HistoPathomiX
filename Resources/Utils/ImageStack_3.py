@@ -263,26 +263,55 @@ class PathologyVolume:
         self.successfulInitialization = True
         return True
 
+    #
+# FIXED AND ROBUST VERSION
+#
     def updateVolumeSpacing(self):
-        """Update volume spacing based on slice positions and pixel sizes"""
-        if not self.pathologySlices or not self.slicePositions:
+        """Update volume spacing based on slice positions and pixel sizes, ensuring Z-spacing is never zero."""
+        if not self.pathologySlices:
+            if self.verbose:
+                print("Warning: Cannot update volume spacing, no pathology slices loaded.")
             return
+
+        # --- Calculate Z-spacing ---
+        z_spacing = 0.0
+        if self.noSlices > 1:
+            # The most reliable method: calculate spacing from the Z-position of the first two slices.
+            # Ensure slice positions have been calculated.
+            if len(self.slicePositions) > 1:
+                z_spacing = abs(self.slicePositions[1] - self.slicePositions[0])
+            else:
+                # Fallback if slicePositions isn't ready for some reason
+                z_spacing = abs(self.pathologySlices[1].zPosition - self.pathologySlices[0].zPosition)
             
-        # Calculate average Z spacing from slice thicknesses
-        if len(self.pathologySlices) > 1:
-            avg_z_spacing = self.totalVolumeThickness / (self.noSlices - 1)
-        else:
-            avg_z_spacing = self.pathologySlices[0].sliceThickness
-            
-        # Convert pixel sizes from micrometers to millimeters
+            # If the positions are identical (z_spacing is zero), fall back to the slice thickness.
+            if z_spacing < 1e-6: # Use a small tolerance for floating point comparison
+                if self.verbose:
+                    print("Warning: Z-positions of first two slices are identical. Using first slice's thickness as Z-spacing.")
+                z_spacing = self.pathologySlices[0].sliceThickness
+        
+        elif self.noSlices == 1:
+            # For a single slice, its "thickness" is its Z-dimension spacing.
+            if self.verbose:
+                print("Info: Only one slice found. Using its thickness as Z-spacing.")
+            z_spacing = self.pathologySlices[0].sliceThickness
+
+        # --- FINAL SAFETY CHECK ---
+        # If, after all of the above, z_spacing is still zero or negative, default to 1.0 to prevent crashing.
+        if z_spacing <= 1e-6:
+            if self.verbose:
+                print(f"CRITICAL WARNING: Calculated Z-spacing is {z_spacing}. This is invalid. Defaulting to 1.0 to prevent error.")
+            z_spacing = 1.0
+
+        # --- Calculate X and Y spacing ---
         x_spacing = self.pix_size_x / 1000.0 if self.pix_size_x > 0 else 1.0
         y_spacing = self.pix_size_y / 1000.0 if self.pix_size_y > 0 else 1.0
         
-        self.volumeSpacing = [x_spacing, y_spacing, avg_z_spacing]
+        self.volumeSpacing = [x_spacing, y_spacing, z_spacing]
         
         if self.verbose:
             print(f"Volume spacing set to: {self.volumeSpacing} mm")
-
+            
     def printTransform(self, ref=None):
         """Print transforms for debugging"""
         if self.pathologySlices:

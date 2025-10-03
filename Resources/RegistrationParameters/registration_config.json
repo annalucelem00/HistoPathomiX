@@ -1,0 +1,12 @@
+{
+    "comment": "Registration configuration parameters",
+    
+    "parameter_files": [
+      "QuickCenteringRigid.txt",
+      "Similarity.txt",
+      "Affine.txt",
+      "Deformable.txt"
+    ],
+    
+    "moving_mask": null
+  }

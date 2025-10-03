@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-IT WORKS with the transformation matrix!!!!
-This version supports multi-image workflows in the GUI.
+Qui Viene inserito il flip
 """
 
 import sys
@@ -59,6 +58,36 @@ class Landmark:
     def from_dict(cls, data: Dict[str, Any]) -> 'Landmark':
         return cls(**data)
 
+# NOTA: Questa classe non è attualmente utilizzata dalla GUI, ma il bug è stato corretto.
+class FlipDataManager:
+    """Class to manage flip data for images"""
+    
+    def __init__(self):
+        self.flip_data: Dict[str, Dict[str, bool]] = {}  # {filename: {'vertical': bool, 'horizontal': bool}}
+    
+    def add_flip_data(self, filename: str, vertical_flip: bool, horizontal_flip: bool):
+        """Add flip data for a specific image"""
+        self.flip_data[filename] = {
+            'vertical': vertical_flip,
+            # CORREZIONE: Corretto l'errore di battitura da 'flip_horizontal' a 'horizontal_flip'
+            'horizontal': horizontal_flip
+        }
+    
+    def get_flip_data(self, filename: str) -> Optional[Dict[str, bool]]:
+        """Get flip data for a specific image"""
+        return self.flip_data.get(filename)
+    
+    def export_to_csv(self, filepath: str):
+        """Export flip data to CSV"""
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['filename', 'vertical_flip', 'horizontal_flip'])
+            writer.writeheader()
+            for filename, flips in self.flip_data.items():
+                writer.writerow({
+                    'filename': filename, 
+                    'vertical_flip': flips['vertical'],
+                    'horizontal_flip': flips['horizontal']
+                })
 
 class ThinPlateSpline:
     """
@@ -220,6 +249,8 @@ class BigWarpGUI:
         self.moving_images: Dict[str, np.ndarray] = {}
         self.landmarks_sets: Dict[str, List[Landmark]] = {}
         self.results: Dict[str, Dict[str, Any]] = {} # To store tps, transformed_image, angle etc.
+
+        self.flip_states: Dict[str, Dict[str, bool]] = {}  # {image_key: {'vertical': bool, 'horizontal': bool}}
         
         self.active_moving_image_key: Optional[str] = None
         
@@ -254,6 +285,28 @@ class BigWarpGUI:
         # --- Gruppo 1: Load Data ---
         load_frame = ttk.LabelFrame(top_toolbar, text="1. Load Data")
         load_frame.grid(row=0, column=0, padx=5, pady=2, sticky="ew")
+        flip_control_frame = ttk.Frame(load_frame)
+        flip_control_frame.pack(pady=2, fill=tk.X)
+        
+        ttk.Label(flip_control_frame, text="Flip Active Image:").pack(side=tk.LEFT, padx=(3, 5))
+        
+        self.flip_vertical_btn = ttk.Button(
+            flip_control_frame, 
+            text="Flip Vertical ↕", 
+            command=self.flip_vertical
+        )
+        self.flip_vertical_btn.pack(side=tk.LEFT, padx=3, pady=3)
+        
+        self.flip_horizontal_btn = ttk.Button(
+            flip_control_frame, 
+            text="Flip Horizontal ↔", 
+            command=self.flip_horizontal
+        )
+        self.flip_horizontal_btn.pack(side=tk.LEFT, padx=3, pady=3)
+        
+        # Status label per mostrare lo stato corrente dei flip
+        self.flip_status_label = ttk.Label(flip_control_frame, text="No flips applied")
+        self.flip_status_label.pack(side=tk.LEFT, padx=(10, 3))
         
         load_buttons_frame = ttk.Frame(load_frame)
         load_buttons_frame.pack(pady=2, fill=tk.X)
@@ -293,6 +346,7 @@ class BigWarpGUI:
         ttk.Button(save_buttons_frame, text="Export Result", command=self.export_result).pack(side=tk.LEFT, padx=3, pady=3)
         # --- NEW: Button to export all angles ---
         ttk.Button(save_buttons_frame, text="Export All Angles", command=self.export_all_angles).pack(side=tk.LEFT, padx=3, pady=3)
+        ttk.Button(save_buttons_frame, text="Export All Flips", command=self.export_all_flips).pack(side=tk.LEFT, padx=3, pady=3)
 
         # Table and status bar setup
         self.landmark_table.heading("fixed_x", text="Fixed X")
@@ -321,6 +375,7 @@ class BigWarpGUI:
         if selected_key and selected_key in self.moving_images:
             self.active_moving_image_key = selected_key
             self.status_var.set(f"Active image: {self.active_moving_image_key}")
+            self.update_flip_status()
             self.update_landmark_table()
             self.update_display()
 
@@ -356,6 +411,7 @@ class BigWarpGUI:
                 self.moving_images[key] = np.array(image.convert('RGB'))
                 self.landmarks_sets[key] = []
                 self.results[key] = {}
+                self.flip_states[key] = {'vertical': False, 'horizontal': False}
                 loaded_count += 1
             except Exception as e:
                 messagebox.showerror("Error", f"Could not load image {os.path.basename(fn)}: {e}")
@@ -547,16 +603,124 @@ class BigWarpGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Could not export data: {e}")
 
+
+    def flip_vertical(self):
+        """Flip the active moving image vertically"""
+        if not self.active_moving_image_key:
+            messagebox.showwarning("Warning", "No active moving image.")
+            return
+        
+        key = self.active_moving_image_key
+        
+        # Flip the image
+        self.moving_images[key] = np.flipud(self.moving_images[key])
+        
+        # Update flip state
+        if key not in self.flip_states:
+            self.flip_states[key] = {'vertical': False, 'horizontal': False}
+        self.flip_states[key]['vertical'] = not self.flip_states[key]['vertical']
+        
+        # Update landmarks coordinates
+        if key in self.landmarks_sets:
+            h = self.moving_images[key].shape[0]
+            for lm in self.landmarks_sets[key]:
+                lm.moving_y = h - 1 - lm.moving_y
+        
+        self.update_flip_status()
+        self.update_display()
+        self.status_var.set(f"Vertical flip applied to '{key}'")
+
+    def flip_horizontal(self):
+        """Flip the active moving image horizontally"""
+        if not self.active_moving_image_key:
+            messagebox.showwarning("Warning", "No active moving image.")
+            return
+        
+        key = self.active_moving_image_key
+        
+        # Flip the image
+        self.moving_images[key] = np.fliplr(self.moving_images[key])
+        
+        # Update flip state
+        if key not in self.flip_states:
+            self.flip_states[key] = {'vertical': False, 'horizontal': False}
+        self.flip_states[key]['horizontal'] = not self.flip_states[key]['horizontal']
+        
+        # Update landmarks coordinates
+        if key in self.landmarks_sets:
+            w = self.moving_images[key].shape[1]
+            for lm in self.landmarks_sets[key]:
+                lm.moving_x = w - 1 - lm.moving_x
+        
+        self.update_flip_status()
+        self.update_display()
+        self.status_var.set(f"Horizontal flip applied to '{key}'")
+
+    def update_flip_status(self):
+        """Update the flip status label"""
+        if not self.active_moving_image_key:
+            self.flip_status_label.config(text="No flips applied")
+            return
+        
+        key = self.active_moving_image_key
+        if key not in self.flip_states or (not self.flip_states[key]['vertical'] and not self.flip_states[key]['horizontal']):
+            self.flip_status_label.config(text="No flips applied")
+        else:
+            flips = []
+            if self.flip_states[key]['vertical']:
+                flips.append("V")
+            if self.flip_states[key]['horizontal']:
+                flips.append("H")
+            self.flip_status_label.config(text=f"Flips: {', '.join(flips)}")
+
+    def export_all_flips(self):
+        """Export flip data for all images to CSV"""
+        if not self.flip_states:
+            messagebox.showwarning("Warning", "No flip data to export.")
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            title="Export All Flip Data",
+            defaultextension=".csv",
+            filetypes=[("CSV File", "*.csv"), ("All files", "*.*")]
+        )
+        if not filename:
+            return
+        
+        try:
+            with open(filename, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['filename', 'vertical_flip', 'horizontal_flip'])
+                writer.writeheader()
+                for key, flips in self.flip_states.items():
+                    writer.writerow({
+                        'filename': key,
+                        'vertical_flip': flips.get('vertical', False),
+                        'horizontal_flip': flips.get('horizontal', False)
+                    })
+            messagebox.showinfo("Success", f"Exported flip data for {len(self.flip_states)} images.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not export flip data: {e}")
+
+    # MODIFICA: Corretto il bug che impediva di mostrare i parametri
     def show_transform_parameters(self):
         """
-        Calculates and displays the parameters of the affine part of the TPS transformation.
+        Calculates and displays the parameters of the affine part of the TPS transformation
+        for the currently active image.
         """
-        if self.tps is None:
-            messagebox.showwarning("Warning", "Compute the TPS transformation first.")
+        if not self.active_moving_image_key:
+            messagebox.showwarning("Warning", "No active image selected.")
+            return
+            
+        key = self.active_moving_image_key
+        active_results = self.results.get(key, {})
+        
+        if 'tps' not in active_results:
+            messagebox.showwarning("Warning", "Compute the TPS transformation for the active image first.")
             return
 
+        tps = active_results['tps']
         # Get the 3x3 affine matrix
-        affine_matrix = self.tps.get_affine_parameters()
+        affine_matrix = tps.get_affine_parameters()
         
         # Extract the 2x2 submatrix for rotation/scaling/shear analysis
         M = affine_matrix[0:2, 0:2]
@@ -567,7 +731,6 @@ class BigWarpGUI:
         scale_y = np.sqrt(M[0, 1]**2 + M[1, 1]**2)
 
         # 2. Rotation
-        # atan2 is more robust than atan for calculating the angle
         rotation_rad = math.atan2(M[1, 0], M[0, 0])
         rotation_deg = math.degrees(rotation_rad)
 
@@ -585,7 +748,7 @@ class BigWarpGUI:
 
         # Prepare the text to display
         info_text = (
-            "Parameters of the Affine Component of the TPS Transformation\n"
+            f"Parameters for '{key}'\n"
             "----------------------------------------------------------\n\n"
             f"Rotation Angle: {rotation_deg:.2f} degrees\n"
             f"Scaling (X, Y): ({scale_x:.3f}, {scale_y:.3f})\n"
@@ -601,7 +764,7 @@ class BigWarpGUI:
 
         # Create a new window to show the information
         info_window = tk.Toplevel(self.root)
-        info_window.title("Transformation Parameters")
+        info_window.title(f"Transformation Parameters for {key}")
         info_window.geometry("500x350")
         
         text_widget = tk.Text(info_window, wrap='word', font=("Courier New", 10))
@@ -611,20 +774,39 @@ class BigWarpGUI:
         
         ttk.Button(info_window, text="Close", command=info_window.destroy).pack(pady=5)
         
+    # MODIFICA: Salvataggio dell'angolo di rotazione e dello stato del flip nel JSON
     def save_landmarks(self):
-        if not self.active_moving_image_key: return messagebox.showwarning("Warning", "No active image.")
+        if not self.active_moving_image_key:
+            return messagebox.showwarning("Warning", "No active image.")
         key = self.active_moving_image_key
-        if not self.landmarks_sets[key]: return messagebox.showwarning("Warning", f"No landmarks for '{key}'.")
+        if not self.landmarks_sets.get(key):
+            return messagebox.showwarning("Warning", f"No landmarks for '{key}'.")
         
         filename = filedialog.asksaveasfilename(
-            title=f"Save Landmarks for {key}",
+            title=f"Save Landmarks and Parameters for {key}",
             defaultextension=".json", initialfile=f"landmarks_{Path(key).stem}.json"
         )
         if filename:
             try:
+                # Inizia con i landmark
                 data = {'landmarks': [lm.to_dict() for lm in self.landmarks_sets[key]]}
-                with open(filename, 'w') as f: json.dump(data, f, indent=2)
-            except Exception as e: messagebox.showerror("Error", f"Could not save: {e}")
+                
+                # Aggiungi l'angolo di rotazione se è stato calcolato
+                active_results = self.results.get(key, {})
+                if 'rotation_degrees' in active_results:
+                    data['rotation_degrees'] = active_results['rotation_degrees']
+                
+                # Aggiungi lo stato del flip, che è cruciale per il contesto
+                if key in self.flip_states:
+                    data['flip_state'] = self.flip_states[key]
+
+                with open(filename, 'w') as f:
+                    json.dump(data, f, indent=2)
+                
+                messagebox.showinfo("Success", f"Landmarks and parameters for '{key}' saved successfully.")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not save: {e}")
 
     def export_result(self):
         if not self.active_moving_image_key or 'transformed_image' not in self.results.get(self.active_moving_image_key, {}):
@@ -788,5 +970,3 @@ if __name__ == "__main__":
         print(f"\n❌ Missing dependency: {e.name}")
         print("Please install required packages (numpy, matplotlib, Pillow).")
         sys.exit(1)
-
-#Mi serve salvare il rotation angle all'interno del file json inserito in ParsePathology
