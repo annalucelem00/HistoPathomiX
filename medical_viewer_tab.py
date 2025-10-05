@@ -4,6 +4,7 @@ Medical Image Viewer Tab for RadPathFusion
 Medical viewer with controls for MRI, segmentation, and histology.
 This version includes dynamic Multi-Planar Reconstruction (MPR) and
 voxel spacing correction, with a robust crosshair implementation.
+Enhanced with direction matrix and LabelMap support.
 """
 
 import sys
@@ -120,18 +121,38 @@ class MedicalCanvas(FigureCanvas):
         self._crosshairs_initialized = True
         
     def load_mr_data(self, data: Any, name: str = "MRI"):
+        # Apply target direction if data is SimpleITK Image
+        if SITK_AVAILABLE and isinstance(data, sitk.Image):
+            target_direction = [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+            data.SetDirection(target_direction)
+            self.mr_data.spacing = data.GetSpacing()
+        
         self.mr_data.data = data
         self.mr_data.name = name
-        if SITK_AVAILABLE and isinstance(data, sitk.Image):
-            self.mr_data.spacing = data.GetSpacing()
         self.update_max_slices()
         self.init_mpr_coords()
         self.init_crosshairs() # Initialize crosshairs after data is loaded
         self.update_display()
 
     def load_segmentation_data(self, data: Any, name: str = "Segmentation"):
-        self.segmentation_data.data = data; self.segmentation_data.name = name
-        self.update_max_slices(); self.update_display()
+        # Convert to LabelMap if data is SimpleITK Image
+        if SITK_AVAILABLE and isinstance(data, sitk.Image):
+            # Cast to appropriate label type if needed
+            if data.GetPixelID() != sitk.sitkUInt8:
+                data = sitk.Cast(data, sitk.sitkUInt8)
+            
+            # Create LabelMap from the image
+            labelmap_filter = sitk.LabelImageToLabelMapFilter()
+            labelmap = labelmap_filter.Execute(data)
+            
+            # Convert back to label image (maintains LabelMap properties)
+            labelmap_to_image = sitk.LabelMapToLabelImageFilter()
+            data = labelmap_to_image.Execute(labelmap)
+        
+        self.segmentation_data.data = data
+        self.segmentation_data.name = name
+        self.update_max_slices()
+        self.update_display()
 
     def load_histology_data(self, data: Any, name: str = "Histology"):
         self.histology_data.data = data; self.histology_data.name = name
@@ -169,7 +190,7 @@ class MedicalCanvas(FigureCanvas):
 
     def display_axial_view(self):
         self.axial_ax.set_title(f"Axial - Slice {self.current_slice + 1}/{self.max_slices}", color='white', fontsize=10)
-        aspect = self.mr_data.spacing[1] / self.mr_data.spacing[0] if self.mr_data.spacing[0] != 0 else 1.0
+        aspect = self.mr_data.spacing[1] / self.mr_data.spacing[0]
         if self.mr_data.visible and self.mr_data.data is not None:
             mr_slice = self.mr_data.get_slice(self.current_slice)
             if mr_slice is not None:
@@ -192,14 +213,14 @@ class MedicalCanvas(FigureCanvas):
         array = self.mr_data.get_array()
         if self.mr_data.visible and array is not None and len(array.shape) >= 3 and 0 <= self.mpr_coords['y'] < array.shape[1]:
             coronal_slice = np.rot90(array[:, self.mpr_coords['y'], :], k=2)
-            self.coronal_ax.imshow(coronal_slice, cmap='gray', aspect=self.mr_data.spacing[2]/self.mr_data.spacing[0] if self.mr_data.spacing[0] != 0 else 1.0)
+            self.coronal_ax.imshow(coronal_slice, cmap='gray', aspect=self.mr_data.spacing[2]/self.mr_data.spacing[0])
 
     def display_sagittal_view(self):
         self.sagittal_ax.set_title(f"Sagittal - Col {self.mpr_coords['x']}", color='white', fontsize=10)
         array = self.mr_data.get_array()
         if self.mr_data.visible and array is not None and len(array.shape) >= 3 and 0 <= self.mpr_coords['x'] < array.shape[2]:
             sagittal_slice = np.rot90(array[:, :, self.mpr_coords['x']], k=2)
-            self.sagittal_ax.imshow(sagittal_slice, cmap='gray', aspect=self.mr_data.spacing[2]/self.mr_data.spacing[1] if self.mr_data.spacing[1] != 0 else 1.0)
+            self.sagittal_ax.imshow(sagittal_slice, cmap='gray', aspect=self.mr_data.spacing[2]/self.mr_data.spacing[1])
 
     def update_crosshairs(self):
         if not self._crosshairs_initialized: return
@@ -269,10 +290,9 @@ class MedicalCanvas(FigureCanvas):
 class MedicalViewer(QWidget):
     """Main widget for medical visualization"""
     data_loaded = pyqtSignal(str, object)
-    
-    # MODIFICA: Il segnale ora emette una tupla (nome, percorso)
     mr_file_loaded = pyqtSignal(str, str)     # (nome_file, percorso_file)
     seg_file_loaded = pyqtSignal(str, str)    # (nome_file, percorso_file)
+    status_message_changed = pyqtSignal(str, int) # (messaggio, timeout)
     
     def __init__(self):
         super().__init__()
@@ -343,85 +363,20 @@ class MedicalViewer(QWidget):
 
         try:
             data, array_data = None, None
-            file_name = os.path.basename(file_path) 
-            
             if data_type == 'histology' and not file_path.endswith(('.nii', '.nii.gz', '.mhd')):
                 data = imread(file_path)
             else:
                 if not SITK_AVAILABLE:
                     QMessageBox.warning(self, "Error", "SimpleITK is needed for this file type."); return
                 data = sitk.ReadImage(file_path)
-                
-                # NUOVO: Applica la direzione target per MRI
-                if data_type == 'mr':
-                    target_direction = [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
-                    current_direction = data.GetDirection()
-                    
-                    # Controlla se la direzione è diversa
-                    if current_direction != target_direction:
-                        # Crea un resampler per cambiare solo la direzione
-                        resampler = sitk.ResampleImageFilter()
-                        resampler.SetOutputDirection(target_direction)
-                        resampler.SetOutputOrigin(data.GetOrigin())
-                        resampler.SetOutputSpacing(data.GetSpacing())
-                        resampler.SetSize(data.GetSize())
-                        resampler.SetInterpolator(sitk.sitkLinear)
-                        resampler.SetDefaultPixelValue(0)
-                        
-                        # Calcola la transform necessaria
-                        # Identity transform - cambiamo solo la direzione nel reference space
-                        resampler.SetTransform(sitk.Transform())
-                        
-                        data = resampler.Execute(data)
-                        self.statusBar().showMessage(f"MRI direction adjusted to target direction", 3000)
-                
-                # NUOVO: Converti segmentazione in LabelMap
-                elif data_type == 'segmentation':
-                    # Verifica se è già un LabelMap (tipo pixel intero)
-                    pixel_id = data.GetPixelID()
-                    if pixel_id not in [sitk.sitkUInt8, sitk.sitkUInt16, sitk.sitkUInt32, 
-                                    sitk.sitkInt8, sitk.sitkInt16, sitk.sitkInt32]:
-                        # Converti in LabelMap (UInt8 se i valori sono piccoli, altrimenti UInt16)
-                        stats = sitk.StatisticsImageFilter()
-                        stats.Execute(data)
-                        max_label = stats.GetMaximum()
-                        
-                        if max_label <= 255:
-                            data = sitk.Cast(data, sitk.sitkUInt8)
-                        else:
-                            data = sitk.Cast(data, sitk.sitkUInt16)
-                        
-                        self.statusBar().showMessage(f"Segmentation converted to LabelMap", 3000)
-                    
-                    # Applica la stessa direzione della MRI se disponibile
-                    if hasattr(self.canvas, 'mr_data') and self.canvas.mr_data.data is not None:
-                        if isinstance(self.canvas.mr_data.data, sitk.Image):
-                            target_direction = self.canvas.mr_data.data.GetDirection()
-                            if data.GetDirection() != target_direction:
-                                resampler = sitk.ResampleImageFilter()
-                                resampler.SetOutputDirection(target_direction)
-                                resampler.SetOutputOrigin(data.GetOrigin())
-                                resampler.SetOutputSpacing(data.GetSpacing())
-                                resampler.SetSize(data.GetSize())
-                                resampler.SetInterpolator(sitk.sitkNearestNeighbor)  # Importante per labelmap!
-                                resampler.SetDefaultPixelValue(0)
-                                resampler.SetTransform(sitk.Transform())
-                                data = resampler.Execute(data)
             
             array_data = sitk.GetArrayFromImage(data) if SITK_AVAILABLE and isinstance(data, sitk.Image) else data
             load_method = getattr(self.canvas, f"load_{data_type}_data")
             load_method(data, os.path.basename(file_path))
-            
-            self.update_slice_controls()
+
+            if data_type == 'mr': self.update_slice_controls()
             self.data_loaded.emit(data_type, array_data)
             QMessageBox.information(self, "Success", f"{data_type.title()} loaded.")
-
-            # Emette il segnale con nome e percorso
-            if data_type == 'mr':
-                self.mr_file_loaded.emit(file_name, file_path)
-            elif data_type == 'segmentation':
-                self.seg_file_loaded.emit(file_name, file_path)
-
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load {data_type} file: {e}")
 
