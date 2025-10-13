@@ -1,16 +1,18 @@
 # File: main.py
-
+#in tesi_7_finale manipolo le cartelle!!! ATTENZIONE
 import sys
 import json
 import os
 import logging
 from pathlib import Path
 
+
 # Importazioni di base di PyQt6
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QTabWidget,
     QLabel, QTextEdit, QMessageBox, QFileDialog
 )
+from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap, QColor, QPalette
 
@@ -77,6 +79,7 @@ class MainWindow(QMainWindow):
         self.registration_tab = RegistrationTab()
         info_tab = self.create_info_tab()
 
+
         # Gestisci i tab condizionali
         if BIGWARP_AVAILABLE:
             self.bigwarp_tab = BigWarpTab()
@@ -93,8 +96,14 @@ class MainWindow(QMainWindow):
             placeholder_layout.addWidget(QLabel("Medical Viewer not available."))
             placeholder_layout.addWidget(QLabel("Please install matplotlib to enable this feature."))
             self.tabs.addTab(placeholder_tab, "Medical Viewer")
+
+        self.medical_viewer.mr_file_loaded.connect(
+        lambda name, path: self.registration_tab.update_from_viewer('mr', name, path))
+        self.medical_viewer.seg_file_loaded.connect(
+        lambda name, path: self.registration_tab.update_from_viewer('segmentation', name, path))
             
         self.tabs.addTab(self.registration_tab, "4. Registration")
+        self.pathology_tab.pathology_volume_updated.connect(self.registration_tab.receive_pathology_volume)
 
         self.registration_results_tab = RegistrationResultsViewer()
         self.tabs.addTab(self.registration_results_tab, "5. Registration Results")
@@ -115,15 +124,26 @@ class MainWindow(QMainWindow):
         
         if MATPLOTLIB_AVAILABLE:
             self.pathology_tab.data_loaded.connect(self.send_data_to_viewer)
-            self.registration_tab.data_loaded.connect(self.send_data_to_viewer)
-            self.medical_viewer.mr_file_loaded.connect(self.registration_tab.add_fixed_volume_option)
-            self.medical_viewer.seg_file_loaded.connect(self.registration_tab.add_fixed_mask_option)
+            #self.registration_tab.data_loaded.connect(self.send_data_to_viewer)
+            self.medical_viewer.mr_file_loaded.connect(
+                lambda name, path: self.registration_tab.update_from_viewer('mr', name, path))
+            self.medical_viewer.seg_file_loaded.connect(
+                lambda name, path: self.registration_tab.update_from_viewer('segmentation', name, path))
 
+            # <<< AGGIUNTA: Collega il parser al registration tab per i volumi MOVING >>>
+            self.pathology_tab.moving_volume_generated.connect(
+                lambda name, path: self.registration_tab.update_from_viewer('moving_volume', name, path))
+            self.pathology_tab.moving_mask_generated.connect(
+                lambda name, path: self.registration_tab.update_from_viewer('moving_mask', name, path))
             self.medical_viewer.status_message_changed.connect(self.statusBar().showMessage)
+
+            self.registration_tab.registration_succeeded.connect(self.handle_registration_success)
 
         layout.addWidget(self.tabs)
         self.create_menu_bar()
         self.statusBar().showMessage("Ready")
+
+
         
     def send_data_to_viewer(self, data_type: str, data):
         if self.medical_viewer and self.medical_viewer.canvas:
@@ -224,16 +244,28 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             if self.medical_viewer:
                 self.reset_viewer()
+            
+            # Pulisce il tab di Patologia
             self.pathology_tab.json_input.clear()
             self.pathology_tab.volume_input.clear() 
             self.pathology_tab.mask_input.clear()
             self.pathology_tab.json_info.clear()
             self.pathology_tab.slices_table.setRowCount(0)
-            self.registration_tab.moving_volume_input.clear()
+
+            # <<< MODIFICA: Pulisce correttamente il tab di Registrazione >>>
+            # Svuota i QComboBox e ripristina l'opzione di default
+            for combo in [self.registration_tab.fixed_volume_combo,
+                          self.registration_tab.fixed_mask_combo,
+                          self.registration_tab.moving_volume_combo,
+                          self.registration_tab.moving_mask_combo]:
+                combo.clear()
+                combo.addItem("Load from Viewer or Browse...")
+
             self.registration_tab.output_input.clear()
             self.registration_tab.elastix_input.clear()
             self.registration_tab.log_output.clear()
             QMessageBox.information(self, "New Project", "New project created.")
+
         
     def open_project(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -300,6 +332,26 @@ class MainWindow(QMainWindow):
             "Based on the original project:\n"
             "https://github.com/pimed/Slicer-RadPathFusion"
         )
+
+    @pyqtSlot(dict)
+    def handle_registration_success(self, results_dict):
+        """
+        Questo slot viene chiamato quando la registrazione ha successo.
+        1. Chiama lo slot del viewer per caricare i dati.
+        2. Passa alla scheda del viewer per mostrare i risultati.
+        """
+        logger.info("Main window received registration_succeeded signal.")
+        
+        # Passa il dizionario dei risultati allo slot del viewer dei risultati
+        if self.registration_results_tab:
+            # Inside your main window class, in the handle_registration_success method
+            self.registration_results_tab.load_data_from_registration(results_dict)
+            
+            # Cambia automaticamente il focus sulla scheda del viewer dei risultati
+            self.tabs.setCurrentWidget(self.registration_results_tab)
+        else:
+            QMessageBox.warning(self, "Error", "Registration results viewer tab not found.")
+
 
 def main():
     app = QApplication(sys.argv)

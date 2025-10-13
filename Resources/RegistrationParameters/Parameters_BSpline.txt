@@ -1,0 +1,66 @@
+// Elastix Parameter File for B-Spline Deformable Registration
+// Compatible with Elastix 5.x
+
+// **************** Main Components **************************
+
+(FixedInternalImagePixelType "float")
+(MovingInternalImagePixelType "float")
+(FixedImageDimension 3)
+(MovingImageDimension 3)
+(UseDirectionCosines "true")
+
+// **************** Registration **************************
+
+(Registration "MultiResolutionRegistration")
+(Interpolator "BSplineInterpolator")
+(ResampleInterpolator "FinalBSplineInterpolator")
+(Resampler "DefaultResampler")
+(FixedImagePyramid "FixedSmoothingImagePyramid")
+(MovingImagePyramid "MovingSmoothingImagePyramid")
+(Optimizer "AdaptiveStochasticGradientDescent")
+(Transform "BSplineTransform")
+(Metric "AdvancedMattesMutualInformation")
+
+// **************** Transformation **************************
+
+(FinalGridSpacingInPhysicalUnits 10.0 10.0 10.0)
+(GridSpacingSchedule 4.0 2.0 1.0)
+(HowToCombineTransforms "Compose")
+
+// **************** Pyramid **************************
+
+(NumberOfResolutions 3)
+(ImagePyramidSchedule 16 16 8  8 8 4  4 4 2)
+
+// **************** Optimizer **************************
+
+(MaximumNumberOfIterations 500)
+(ASGDParameterEstimationMethod "Original")
+(MaximumStepLength 2.0)
+(SP_alpha 0.602)
+(SP_A 100.0)
+
+// **************** Metric **************************
+
+(NumberOfHistogramBins 32)
+(NumberOfSpatialSamples 4096)
+(NewSamplesEveryIteration "true")
+(ImageSampler "Random")
+(CheckNumberOfSamples "true")
+
+// **************** Output **************************
+
+(WriteResultImage "true")
+(ResultImagePixelType "short")
+(ResultImageFormat "mhd")
+(CompressResultImage "false")
+(WriteTransformParametersEachIteration "false")
+(WriteTransformParametersEachResolution "false")
+(WriteResultImageAfterEachResolution "false")
+(ShowExactMetricValue "false")
+(ErodeMask "false")
+
+// **************** Advanced **************************
+
+(UseFastAndLowMemoryVersion "true")
+(UseMultiThread "true")

@@ -374,12 +374,17 @@ class MedicalViewer(QWidget):
             load_method = getattr(self.canvas, f"load_{data_type}_data")
             load_method(data, os.path.basename(file_path))
 
-            if data_type == 'mr': self.update_slice_controls()
+            if data_type == 'mr': 
+                self.update_slice_controls()
+                self.mr_file_loaded.emit(os.path.basename(file_path), file_path)  # AGGIUNGI QUESTA RIGA
+            elif data_type == 'segmentation':
+                self.seg_file_loaded.emit(os.path.basename(file_path), file_path)  # AGGIUNGI QUESTA RIGA
+                
             self.data_loaded.emit(data_type, array_data)
             QMessageBox.information(self, "Success", f"{data_type.title()} loaded.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load {data_type} file: {e}")
-
+            
     def load_mr_data(self): self.load_data_file("mr", "Load MRI", "Medical Images (*.dcm *.nii *.nii.gz *.mhd)")
     def load_segmentation_data(self): self.load_data_file("segmentation", "Load Segmentation", "Medical Images (*.nii *.nii.gz *.seg.nrrd)")
 

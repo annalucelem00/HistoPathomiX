@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal
 
 # Importa le utility necessarie dalla cartella Resources
-from Resources.Utils.ImageStack_3 import PathologyVolume
+from Resources.Utils.ImageStack import PathologyVolume
 
 # Gestisci l'importazione opzionale di Pillow
 try:
@@ -29,7 +29,11 @@ except ImportError:
 class PathologyParser(QWidget):
     
     data_loaded = pyqtSignal(str, object)
-    
+    moving_volume_generated = pyqtSignal(str, str)  # (nome_file, percorso_completo)
+    moving_mask_generated = pyqtSignal(str, str)   # (nome_file, percorso_completo)
+    pathology_volume_updated = pyqtSignal(object) # Invierà l'istanza di PathologyVolume
+    json_path_updated = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.pathology_volume = None
@@ -120,22 +124,31 @@ class PathologyParser(QWidget):
         actions_layout.addLayout(secondary_actions)
         
         export_actions = QHBoxLayout()
+        
+        # Pulsante per inviare al viewer
         self.send_to_viewer_btn = QPushButton("Send to Viewer")
         self.send_to_viewer_btn.clicked.connect(self.send_to_viewer)
         self.send_to_viewer_btn.setEnabled(False)
+        
+        # Pulsante per salvare il JSON modificato
         self.save_json_btn = QPushButton("Save JSON")
         self.save_json_btn.clicked.connect(self.save_json)
         self.save_json_btn.setEnabled(False)
-        self.export_volume_btn = QPushButton("Export Volume")
-        self.export_volume_btn.clicked.connect(self.export_volume)
-        self.export_volume_btn.setEnabled(False)
+        
+        # Nuovo pulsante che sostituisce il vecchio "Export Volume"
+        self.generate_and_save_btn = QPushButton("Generate & Save Volumes")
+        self.generate_and_save_btn.clicked.connect(self.generate_and_save_volumes)
+        self.generate_and_save_btn.setEnabled(False)
+
+        # Aggiungi i pulsanti al layout
         export_actions.addWidget(self.send_to_viewer_btn)
         export_actions.addWidget(self.save_json_btn)
-        export_actions.addWidget(self.export_volume_btn)
+        export_actions.addWidget(self.generate_and_save_btn) # Aggiungiamo il nuovo pulsante
+        
         actions_layout.addLayout(export_actions)
         actions_group.setLayout(actions_layout)
         layout.addWidget(actions_group)
-
+        
         external_data_group = QGroupBox("Data from BigWarp")
         external_data_layout = QVBoxLayout()
         grid_layout = QHBoxLayout()
@@ -249,6 +262,7 @@ class PathologyParser(QWidget):
                 self.update_slices_display()
                 self.update_volume_info_display()
                 QMessageBox.information(self, "Updated", f"Rectum distance updated to {self.rectum_distance} mm")
+                self.pathology_volume_updated.emit(self.pathology_volume)
             except Exception as e:
                 QMessageBox.warning(self, "Warning", f"Could not update rectum distance: {e}")
         
@@ -275,6 +289,7 @@ class PathologyParser(QWidget):
                 info_lines.append(f"Regions: {', '.join(map(str, self.pathology_volume.regionIDs))}")
                               
             self.volume_info.setText('\n'.join(info_lines))
+            self.pathology_volume_updated.emit(self.pathology_volume)
             
         except Exception as e:
             self.volume_info.setText(f"Error updating info: {e}")
@@ -315,11 +330,74 @@ class PathologyParser(QWidget):
             self.load_volume_btn.setEnabled(True)
             self.load_mask_btn.setEnabled(True)
             self.save_json_btn.setEnabled(True)
+            self.generate_and_save_btn.setEnabled(True)
+            
+            # Emetti i segnali per aggiornare gli altri componenti
+            self.pathology_volume_updated.emit(self.pathology_volume)
+            self.json_path_updated.emit(json_path) # <<< MODIFICA: Emetti il percorso del JSON
             
             QMessageBox.information(self, "Success", "JSON loaded successfully.")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error loading JSON: {e}")
+
+
+    def generate_and_save_volumes(self):
+        if not self.pathology_volume:
+            QMessageBox.warning(self, "Warning", "Please load a pathology JSON file first.")
+            return
+
+        # 1. Chiedi all'utente una cartella di output
+        output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for Volumes")
+        if not output_dir:
+            return # L'utente ha annullato
+
+        # 2. Ottieni i nomi dei file dai QLineEdit
+        volume_name = self.volume_input.text()
+        mask_name = self.mask_input.text()
+
+        if not volume_name or not mask_name:
+            QMessageBox.warning(self, "Input Error", "Please provide names for the output volume and mask.")
+            return
+
+        # Aggiungi un'estensione se non presente (es. .nii.gz)
+        if not volume_name.endswith(('.nii', '.nii.gz', '.nrrd', '.mhd')):
+            volume_name += ".nii.gz"
+        if not mask_name.endswith(('.nii', '.nii.gz', '.nrrd', '.mhd')):
+            mask_name += ".nii.gz"
+            
+        volume_path = os.path.join(output_dir, volume_name)
+        mask_path = os.path.join(output_dir, mask_name)
+
+        try:
+            # 3. Genera e salva il volume di istologia (RGB)
+            QMessageBox.information(self, "Processing", "Generating histology volume... This may take a moment.")
+            self.loaded_volume = self.pathology_volume.loadRgbVolume()
+            if self.loaded_volume:
+                sitk.WriteImage(self.loaded_volume, volume_path)
+                # <<< EMETTI IL SEGNALE PER IL MOVING VOLUME >>>
+                self.moving_volume_generated.emit(volume_name, volume_path)
+                QMessageBox.information(self, "Success", f"Histology volume saved to:\n{volume_path}")
+            else:
+                raise Exception("Failed to generate RGB volume.")
+
+            # 4. Genera e salva la maschera
+            QMessageBox.information(self, "Processing", "Generating histology mask...")
+            mask_id = self.mask_id_spin.value()
+            self.loaded_mask = self.pathology_volume.loadMask(idxMask=mask_id)
+            if self.loaded_mask:
+                sitk.WriteImage(self.loaded_mask, mask_path)
+                # <<< EMETTI IL SEGNALE PER LA MOVING MASK >>>
+                self.moving_mask_generated.emit(mask_name, mask_path)
+                QMessageBox.information(self, "Success", f"Histology mask saved to:\n{mask_path}")
+            else:
+                raise Exception(f"Failed to generate mask with ID {mask_id}.")
+
+            # 5. Abilita l'invio al viewer ora che i dati sono in memoria
+            self.send_to_viewer_btn.setEnabled(True)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An error occurred during volume generation/saving: {e}")
 
     def receive_rotation_data(self, rotation_data: Dict[str, float]):
         """Receive rotation data from BigWarp tab"""
@@ -376,6 +454,7 @@ class PathologyParser(QWidget):
             QMessageBox.warning(self, "Warning", "Load JSON and flip data first.")
             return
         self.auto_match_and_apply_flips()
+        self.pathology_volume_updated.emit(self.pathology_volume)
 
     def auto_match_filenames(self):
         """Automatically match rotation angles to slices by filename"""
@@ -406,6 +485,7 @@ class PathologyParser(QWidget):
             
             self.update_slices_display()
             self.update_volume_info_display()
+            self.pathology_volume_updated.emit(self.pathology_volume)
             
             QMessageBox.information(
                 self, "Auto-Match Results", 
@@ -494,6 +574,7 @@ class PathologyParser(QWidget):
             
             self.update_slices_display()
             self.update_volume_info_display()
+            self.pathology_volume_updated.emit(self.pathology_volume)
 
             QMessageBox.information(
                 self, "Auto-Match Results",
@@ -511,6 +592,7 @@ class PathologyParser(QWidget):
             QMessageBox.warning(self, "Warning", "No pathology volume loaded. Load JSON first.")
             return
         self.auto_match_filenames()
+        self.pathology_volume_updated.emit(self.pathology_volume)
 
     def update_json_info_display(self):
         if not self.pathology_volume: return
@@ -519,6 +601,7 @@ class PathologyParser(QWidget):
         if hasattr(self.pathology_volume, 'regionIDs'):
             info_text += f"Regions: {', '.join(map(str, self.pathology_volume.regionIDs))}\n"
         self.json_info.setText(info_text)
+        self.pathology_volume_updated.emit(self.pathology_volume)
             
     def update_slices_display(self):
         if not self.pathology_volume or not hasattr(self.pathology_volume, 'pathologySlices'):
@@ -548,6 +631,7 @@ class PathologyParser(QWidget):
             QMessageBox.warning(self, "Warning", f"Error updating slice display: {e}")
         finally:
             self.slices_table.blockSignals(False)
+            self.pathology_volume_updated.emit(self.pathology_volume)
 
     def on_slice_item_changed(self, item):
         if not self.pathology_volume: return
@@ -568,6 +652,7 @@ class PathologyParser(QWidget):
         if current_row < 0:
             return
         self.edit_selected_slice()
+        self.pathology_volume_updated.emit(self.pathology_volume)
         
     def edit_selected_slice(self):
         current_row = self.slices_table.currentRow()
@@ -575,6 +660,7 @@ class PathologyParser(QWidget):
             QMessageBox.warning(self, "Warning", "Please select a slice to edit")
             return
         self.open_slice_editor(current_row)
+        self.pathology_volume_updated.emit(self.pathology_volume)
         
     def open_slice_editor(self, slice_idx):
         if not self.pathology_volume or slice_idx >= len(self.pathology_volume.pathologySlices): return
@@ -637,6 +723,7 @@ class PathologyParser(QWidget):
         
         apply_btn.clicked.connect(apply_changes)
         cancel_btn.clicked.connect(dialog.reject)
+        self.pathology_volume_updated.emit(self.pathology_volume)
         
         button_layout.addWidget(apply_btn); button_layout.addWidget(cancel_btn)
         layout.addLayout(button_layout)
@@ -655,12 +742,18 @@ class PathologyParser(QWidget):
             ps = self.pathology_volume.pathologySlices[current_row]
             ps.sliceThickness = thickness
             self.update_slices_display(); self.update_volume_info_display()
+            self.pathology_volume_updated.emit(self.pathology_volume)
 
     def save_json(self):
         if not self.pathology_volume:
             QMessageBox.warning(self, "Warning", "No pathology volume loaded")
             return
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Pathology JSON", "", "JSON files (*.json)")
+        
+        current_path = self.json_input.text()
+        directory = os.path.dirname(current_path) if current_path else ""
+        
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Pathology JSON", current_path, "JSON files (*.json)")
+        
         if file_path:
             original_flips = []
             try:
@@ -671,6 +764,13 @@ class PathologyParser(QWidget):
                 if hasattr(self.pathology_volume, 'saveJson'):
                     if self.pathology_volume.saveJson(file_path):
                         QMessageBox.information(self, "Success", "JSON file saved successfully!")
+                        
+                        # <<< MODIFICHE >>>
+                        # 1. Aggiorna il campo di input nel parser stesso per coerenza
+                        self.json_input.setText(file_path)
+                        # 2. Emetti i segnali con il nuovo percorso per aggiornare le altre tab
+                        self.pathology_volume_updated.emit(self.pathology_volume)
+                        self.json_path_updated.emit(file_path)
                     else:
                         QMessageBox.warning(self, "Warning", "Failed to save JSON file")
             except Exception as e:
