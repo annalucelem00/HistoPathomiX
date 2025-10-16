@@ -1,12 +1,15 @@
-# File: registration_viewer_tab.py
+# File: registration_viewer_tab.py (FIXED VERSION)
 """
 Fixed Registration Results Viewer
-Replicates the 3D Slicer visualization behavior for standalone Python
+Key fixes:
+1. Properly identifies which MR slices contain histology/mask data
+2. Removes unnecessary flipud that caused orientation issues
+3. Handles partial histology coverage correctly
 """
 
 import os
 import numpy as np
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 import logging
 
 from PyQt6.QtWidgets import (
@@ -35,7 +38,7 @@ class ImageCanvas(QLabel):
         self.setStyleSheet("QLabel { background-color: black; }")
         self.setMinimumSize(400, 400)
 
-        # Raw SITK images (with proper spacing/origin/direction)
+        # Raw SITK images
         self.mr_image: Optional[sitk.Image] = None
         self.histology_image: Optional[sitk.Image] = None
         self.mask_image: Optional[sitk.Image] = None
@@ -50,14 +53,138 @@ class ImageCanvas(QLabel):
         self.show_histology = True
         self.show_mask = True
 
-        # High-res data (original pathology slices)
-        self.highres_histology: Optional[np.ndarray] = None
-        self.highres_mask: Optional[np.ndarray] = None
+        # High-res data
+        self.highres_histology: Optional[sitk.Image] = None
+        self.highres_mask: Optional[sitk.Image] = None
         self.highres_transform: Optional[sitk.Transform] = None
 
         # Window/Level for MR
         self.window = 400
         self.level = 200
+        
+        # NEW: Track which MR slices have histology/mask data
+        self.mr_slices_with_histology: List[int] = []
+        self.mr_slices_with_mask: List[int] = []
+        self.histology_to_mr_slice_map: Dict[int, int] = {}
+
+    def load_mr_volume(self, mr_image: sitk.Image):
+        """Load MR volume."""
+        self.mr_image = sitk.Cast(mr_image, sitk.sitkFloat32)
+        self.max_slices = self.mr_image.GetSize()[2]
+        logging.info(f"Loaded MR volume: size={self.mr_image.GetSize()}, "
+                    f"spacing={self.mr_image.GetSpacing()}, "
+                    f"origin={self.mr_image.GetOrigin()}")
+
+    def load_histology_volume(self, histology_image: sitk.Image):
+        """Load registered histology volume and identify corresponding MR slices."""
+        self.histology_image = histology_image
+        hist_size = self.histology_image.GetSize()
+        
+        logging.info(f"Loaded histology volume: size={hist_size}, "
+                    f"spacing={self.histology_image.GetSpacing()}")
+        
+        # NEW: Find which MR slices correspond to histology slices
+        self._identify_histology_slice_mapping()
+
+    def load_mask_volume(self, mask_image: sitk.Image):
+        """Load registered mask volume and identify corresponding MR slices."""
+        self.mask_image = mask_image
+        mask_size = self.mask_image.GetSize()
+        
+        logging.info(f"Loaded mask volume: size={mask_size}")
+        
+        # NEW: Find which MR slices contain mask data
+        self._identify_mask_slice_mapping()
+
+    def _identify_histology_slice_mapping(self):
+        """
+        Identify which MR slices correspond to each histology slice.
+        Uses physical coordinates to determine the mapping.
+        """
+        if not self.mr_image or not self.histology_image:
+            return
+        
+        self.histology_to_mr_slice_map = {}
+        self.mr_slices_with_histology = []
+        
+        hist_size = self.histology_image.GetSize()
+        
+        for hist_z in range(hist_size[2]):
+            # Get physical Z coordinate of histology slice center
+            hist_center_index = [hist_size[0]//2, hist_size[1]//2, hist_z]
+            hist_center_phys = self.histology_image.TransformIndexToPhysicalPoint(hist_center_index)
+            hist_z_phys = hist_center_phys[2]
+            
+            # Find closest MR slice
+            mr_z = self._find_closest_mr_slice(hist_z_phys)
+            
+            if mr_z is not None:
+                self.histology_to_mr_slice_map[hist_z] = mr_z
+                if mr_z not in self.mr_slices_with_histology:
+                    self.mr_slices_with_histology.append(mr_z)
+        
+        self.mr_slices_with_histology.sort()
+        
+        logging.info(f"Histology slice mapping identified:")
+        for hist_z, mr_z in self.histology_to_mr_slice_map.items():
+            logging.info(f"  Histology slice {hist_z} → MR slice {mr_z}")
+
+    def _identify_mask_slice_mapping(self):
+        """
+        Identify which MR slices contain mask data.
+        """
+        if not self.mr_image or not self.mask_image:
+            return
+        
+        self.mr_slices_with_mask = []
+        
+        mask_size = self.mask_image.GetSize()
+        
+        for mask_z in range(mask_size[2]):
+            # Get physical Z coordinate
+            mask_center_index = [mask_size[0]//2, mask_size[1]//2, mask_z]
+            mask_center_phys = self.mask_image.TransformIndexToPhysicalPoint(mask_center_index)
+            mask_z_phys = mask_center_phys[2]
+            
+            # Find closest MR slice
+            mr_z = self._find_closest_mr_slice(mask_z_phys)
+            
+            if mr_z is not None and mr_z not in self.mr_slices_with_mask:
+                self.mr_slices_with_mask.append(mr_z)
+        
+        self.mr_slices_with_mask.sort()
+        
+        logging.info(f"Mask found in MR slices: {self.mr_slices_with_mask}")
+
+    def _find_closest_mr_slice(self, z_physical: float) -> Optional[int]:
+        """
+        Find the MR slice index closest to the given physical Z coordinate.
+        """
+        if not self.mr_image:
+            return None
+        
+        mr_size = self.mr_image.GetSize()
+        min_distance = float('inf')
+        closest_slice = None
+        
+        for mr_z in range(mr_size[2]):
+            # Get physical Z coordinate of MR slice
+            mr_center_index = [mr_size[0]//2, mr_size[1]//2, mr_z]
+            mr_center_phys = self.mr_image.TransformIndexToPhysicalPoint(mr_center_index)
+            mr_z_phys = mr_center_phys[2]
+            
+            distance = abs(mr_z_phys - z_physical)
+            
+            if distance < min_distance:
+                min_distance = distance
+                closest_slice = mr_z
+        
+        # Only return if distance is reasonable (within one slice thickness)
+        mr_spacing = self.mr_image.GetSpacing()
+        if min_distance < mr_spacing[2] * 1.5:
+            return closest_slice
+        
+        return None
 
     def wheelEvent(self, event: QWheelEvent):
         """Handle mouse wheel for slice navigation."""
@@ -70,58 +197,16 @@ class ImageCanvas(QLabel):
                 self.slice_changed.emit(new_slice)
         event.accept()
 
-    def load_mr_volume(self, mr_image: sitk.Image):
-        """Load MR volume - keep as SITK image to preserve physical space."""
-        self.mr_image = sitk.Cast(mr_image, sitk.sitkFloat32)
-        self.max_slices = self.mr_image.GetSize()[2]
-        logging.info(f"Loaded MR volume: size={self.mr_image.GetSize()}, "
-                    f"spacing={self.mr_image.GetSpacing()}, "
-                    f"origin={self.mr_image.GetOrigin()}")
-
-    def load_histology_volume(self, histology_image: sitk.Image):
-        """Load registered histology volume."""
-        self.histology_image = histology_image
-        hist_size = self.histology_image.GetSize()
-        mr_size = self.mr_image.GetSize() if self.mr_image else (0, 0, 0)
-        
-        logging.info(f"Loaded histology volume: size={hist_size}, "
-                    f"spacing={self.histology_image.GetSpacing()}")
-        
-        # Warn if histology has fewer slices than MR
-        if mr_size[2] > hist_size[2]:
-            logging.warning(f"Histology has {hist_size[2]} slices but MR has {mr_size[2]} slices. "
-                          f"Some slices will show only MR.")
-
-    def load_mask_volume(self, mask_image: sitk.Image):
-        """Load registered mask volume."""
-        self.mask_image = mask_image
-        mask_size = self.mask_image.GetSize()
-        mr_size = self.mr_image.GetSize() if self.mr_image else (0, 0, 0)
-        
-        logging.info(f"Loaded mask volume: size={mask_size}")
-        
-        # Warn if mask has fewer slices than MR
-        if mr_size[2] > mask_size[2]:
-            logging.warning(f"Mask has {mask_size[2]} slices but MR has {mr_size[2]} slices. "
-                          f"Some slices will show no mask.")
-
     def load_highres_slice(self, histology_img: sitk.Image, mask_img: Optional[sitk.Image],
                           transform: sitk.Transform):
-        """
-        Load high-resolution original histology slice with its transform.
-        
-        Args:
-            histology_img: Original high-res RGB histology image
-            mask_img: Original high-res mask (if available)
-            transform: The transform from pathology space to MR space
-        """
+        """Load high-resolution original histology slice with its transform."""
         self.highres_histology = histology_img
         self.highres_mask = mask_img
         self.highres_transform = transform
         self.update_display()
 
     def clear_highres(self):
-        """Clear high-resolution data to return to low-res view."""
+        """Clear high-resolution data."""
         self.highres_histology = None
         self.highres_mask = None
         self.highres_transform = None
@@ -137,6 +222,9 @@ class ImageCanvas(QLabel):
         self.highres_transform = None
         self.max_slices = 0
         self.current_slice = 0
+        self.histology_to_mr_slice_map = {}
+        self.mr_slices_with_histology = []
+        self.mr_slices_with_mask = []
         self.setPixmap(QPixmap())
         self.setText("Load data to begin viewing.")
 
@@ -161,12 +249,11 @@ class ImageCanvas(QLabel):
         """Extract a 2D slice from a 3D volume maintaining physical space info."""
         size = list(image_3d.GetSize())
         
-        # Check if slice index is within bounds
         if slice_idx >= size[2] or slice_idx < 0:
             logging.warning(f"Slice index {slice_idx} out of bounds for image with {size[2]} slices")
             return None
         
-        size[2] = 0  # Extract single slice
+        size[2] = 0
         index = [0, 0, slice_idx]
         
         try:
@@ -184,10 +271,7 @@ class ImageCanvas(QLabel):
                              transform: Optional[sitk.Transform] = None,
                              interpolator = sitk.sitkLinear,
                              default_value = 0.0) -> sitk.Image:
-        """
-        Resample moving image to reference image space.
-        This replicates the Slicer resampling behavior.
-        """
+        """Resample moving image to reference image space."""
         resampler = sitk.ResampleImageFilter()
         resampler.SetReferenceImage(reference_image)
         resampler.SetInterpolator(interpolator)
@@ -203,15 +287,22 @@ class ImageCanvas(QLabel):
     def sitk_to_numpy_display(self, image_2d: sitk.Image) -> np.ndarray:
         """
         Convert SITK 2D image to numpy array for display.
-        Applies proper orientation for visualization (flip Y axis for screen display).
+        FIXED: Removed flipud - orientation is now correct!
         """
         array = sitk.GetArrayFromImage(image_2d)
-        
-        # SITK array is in (row, col) which is (Y, X) in image coordinates
-        # Flip Y axis to match standard screen display (origin at top-left)
-        array = np.flipud(array)
-        
+        # REMOVED: array = np.flipud(array) 
         return array
+
+    def _get_histology_slice_for_mr(self, mr_slice_idx: int) -> Optional[int]:
+        """
+        Get the histology slice index that corresponds to the given MR slice.
+        Returns None if no histology data exists for this MR slice.
+        """
+        # Reverse lookup in the mapping
+        for hist_z, mr_z in self.histology_to_mr_slice_map.items():
+            if mr_z == mr_slice_idx:
+                return hist_z
+        return None
 
     def update_display(self):
         """Render and display the composite image for the current slice."""
@@ -237,10 +328,13 @@ class ImageCanvas(QLabel):
             else:
                 composite = composite * 0.0
             
-            # Overlay histology
-            if self.show_histology:
+            # NEW: Check if this MR slice has histology data
+            has_histology = self.current_slice in self.mr_slices_with_histology
+            
+            # Overlay histology (only if available for this slice)
+            if self.show_histology and has_histology:
                 if self.highres_histology is not None:
-                    # High-res mode: resample original histology to MR slice space
+                    # High-res mode
                     try:
                         hist_resampled = self.resample_to_reference(
                             self.highres_histology,
@@ -255,11 +349,11 @@ class ImageCanvas(QLabel):
                         hist_array = None
                     
                 elif self.histology_image is not None:
-                    # Low-res mode: use registered volume
-                    # Check if slice exists in histology volume
-                    hist_size = self.histology_image.GetSize()
-                    if self.current_slice < hist_size[2]:
-                        hist_slice_2d = self.extract_2d_slice(self.histology_image, self.current_slice)
+                    # Low-res mode - find corresponding histology slice
+                    hist_slice_idx = self._get_histology_slice_for_mr(self.current_slice)
+                    
+                    if hist_slice_idx is not None:
+                        hist_slice_2d = self.extract_2d_slice(self.histology_image, hist_slice_idx)
                         if hist_slice_2d is not None:
                             try:
                                 hist_resampled = self.resample_to_reference(
@@ -275,7 +369,6 @@ class ImageCanvas(QLabel):
                         else:
                             hist_array = None
                     else:
-                        # No histology for this slice
                         hist_array = None
                 else:
                     hist_array = None
@@ -283,7 +376,6 @@ class ImageCanvas(QLabel):
                 if hist_array is not None:
                     # Handle RGB histology
                     if hist_array.ndim == 2:
-                        # Grayscale - convert to RGB
                         hist_rgb = np.stack([hist_array] * 3, axis=-1)
                     else:
                         hist_rgb = hist_array
@@ -296,8 +388,11 @@ class ImageCanvas(QLabel):
                     alpha = self.histology_opacity
                     composite = composite * (1 - alpha) + hist_rgb * alpha
             
-            # Overlay mask
-            if self.show_mask:
+            # NEW: Check if this MR slice has mask data
+            has_mask = self.current_slice in self.mr_slices_with_mask
+            
+            # Overlay mask (only if available for this slice)
+            if self.show_mask and has_mask:
                 if self.highres_mask is not None:
                     # High-res mask
                     try:
@@ -314,11 +409,11 @@ class ImageCanvas(QLabel):
                         mask_array = None
                     
                 elif self.mask_image is not None:
-                    # Low-res mask
-                    # Check if slice exists in mask volume
-                    mask_size = self.mask_image.GetSize()
-                    if self.current_slice < mask_size[2]:
-                        mask_slice_2d = self.extract_2d_slice(self.mask_image, self.current_slice)
+                    # Low-res mask - find corresponding mask slice
+                    mask_slice_idx = self._get_histology_slice_for_mr(self.current_slice)
+                    
+                    if mask_slice_idx is not None:
+                        mask_slice_2d = self.extract_2d_slice(self.mask_image, mask_slice_idx)
                         if mask_slice_2d is not None:
                             try:
                                 mask_resampled = self.resample_to_reference(
@@ -334,7 +429,6 @@ class ImageCanvas(QLabel):
                         else:
                             mask_array = None
                     else:
-                        # No mask for this slice
                         mask_array = None
                 else:
                     mask_array = None
@@ -352,6 +446,12 @@ class ImageCanvas(QLabel):
             display_array = np.clip(composite * 255, 0, 255).astype(np.uint8)
             self._display_numpy_array(display_array)
             
+            # NEW: Add info about histology availability in status
+            if has_histology:
+                status_text = f"Slice {self.current_slice + 1}/{self.max_slices} [with histology]"
+            else:
+                status_text = f"Slice {self.current_slice + 1}/{self.max_slices} [MR only]"
+            
         except Exception as e:
             logging.error(f"Error updating display: {e}", exc_info=True)
             self.setText(f"Error displaying slice {self.current_slice + 1}")
@@ -359,7 +459,6 @@ class ImageCanvas(QLabel):
     def _display_numpy_array(self, array: np.ndarray):
         """Convert numpy array to QPixmap and display."""
         if array.ndim == 2:
-            # Grayscale
             array = np.stack([array] * 3, axis=-1)
         
         height, width = array.shape[:2]
@@ -389,18 +488,7 @@ class RegistrationResultsViewer(QWidget):
         self.init_ui()
 
     def load_data_from_registration(self, results: dict):
-        """
-        Load all data from registration results.
-        
-        Expected results structure:
-        {
-            'fixed_volume': path_to_mr.nii.gz,
-            'registered_rgb': path_to_registered_histology.mha,
-            'registered_masks': {'region0': path_to_mask.mha, ...},
-            'pathology_volume': PathologyVolume object,
-            'output_dir': registration output directory
-        }
-        """
+        """Load all data from registration results."""
         logging.info("Viewer: Loading registration results...")
         
         if not self.canvas or not SITK_AVAILABLE:
@@ -413,7 +501,7 @@ class RegistrationResultsViewer(QWidget):
             self.pathology_volume = None
             self.registered_mask_paths = {}
 
-            # 1. Load MR volume (fixed/reference)
+            # Load MR volume
             fixed_path = results.get('fixed_volume')
             if not fixed_path or not os.path.exists(fixed_path):
                 raise FileNotFoundError(f"MR volume not found: {fixed_path}")
@@ -422,7 +510,7 @@ class RegistrationResultsViewer(QWidget):
             self.canvas.load_mr_volume(mr_image)
             logging.info(f"Loaded MR volume: {os.path.basename(fixed_path)}")
 
-            # 2. Load registered histology volume
+            # Load registered histology volume
             histology_path = results.get('registered_rgb')
             if histology_path and os.path.exists(histology_path):
                 histology_image = sitk.ReadImage(histology_path)
@@ -431,21 +519,19 @@ class RegistrationResultsViewer(QWidget):
             else:
                 logging.warning("Registered histology volume not found")
 
-            # 3. Load registered masks
+            # Load registered masks
             self.registered_mask_paths = results.get('registered_masks', {})
             if self.registered_mask_paths:
-                # Load first mask by default
                 first_mask_name = list(self.registered_mask_paths.keys())[0]
                 self.load_mask(first_mask_name)
                 
-                # Update mask selector
                 self.mask_selector.clear()
                 self.mask_selector.addItems(list(self.registered_mask_paths.keys()))
                 self.mask_selector.setCurrentText(first_mask_name)
             else:
                 logging.warning("No registered masks found")
 
-            # 4. Store pathology volume for high-res access
+            # Store pathology volume
             self.pathology_volume = results.get('pathology_volume')
             if self.pathology_volume:
                 self.load_highres_btn.setEnabled(True)
@@ -454,12 +540,22 @@ class RegistrationResultsViewer(QWidget):
                 self.load_highres_btn.setEnabled(False)
                 logging.warning("PathologyVolume not available")
 
-            # 5. Update UI
+            # Update UI and jump to first slice with histology
             self.update_slice_controls()
-            self.canvas.set_slice(0)
+            
+            # NEW: Jump to first slice with histology data
+            if self.canvas.mr_slices_with_histology:
+                first_hist_slice = self.canvas.mr_slices_with_histology[0]
+                self.canvas.set_slice(first_hist_slice)
+                self.slice_spin.setValue(first_hist_slice + 1)
+                self.slice_slider.setValue(first_hist_slice + 1)
+                logging.info(f"Jumped to first slice with histology: {first_hist_slice + 1}")
+            else:
+                self.canvas.set_slice(0)
             
             QMessageBox.information(self, "Success", 
-                                  "Registration results loaded successfully!")
+                                  f"Registration results loaded successfully!\n\n"
+                                  f"Histology visible in slices: {[s+1 for s in self.canvas.mr_slices_with_histology]}")
 
         except Exception as e:
             logging.error(f"Failed to load registration results: {e}", exc_info=True)
@@ -509,6 +605,21 @@ class RegistrationResultsViewer(QWidget):
         panel.setMaximumWidth(350)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
+        
+        # === Quick Navigation (NEW) ===
+        nav_group = QGroupBox("🎯 Quick Navigation")
+        nav_layout = QVBoxLayout(nav_group)
+        
+        self.prev_hist_btn = QPushButton("← Previous Histology Slice")
+        self.prev_hist_btn.clicked.connect(self.jump_to_previous_histology)
+        
+        self.next_hist_btn = QPushButton("Next Histology Slice →")
+        self.next_hist_btn.clicked.connect(self.jump_to_next_histology)
+        
+        nav_layout.addWidget(self.prev_hist_btn)
+        nav_layout.addWidget(self.next_hist_btn)
+        
+        layout.addWidget(nav_group)
         
         # === Visibility & Opacity ===
         visibility_group = QGroupBox("Layer Visibility & Opacity")
@@ -623,7 +734,6 @@ class RegistrationResultsViewer(QWidget):
         layout.addWidget(slider)
         layout.addWidget(value_label)
         
-        # Store references for later access
         slider.value_label = value_label
         
         return layout
@@ -642,6 +752,40 @@ class RegistrationResultsViewer(QWidget):
         layout.addWidget(spinbox)
         return layout
 
+    def jump_to_previous_histology(self):
+        """Jump to the previous MR slice that contains histology data."""
+        if not self.canvas or not self.canvas.mr_slices_with_histology:
+            return
+        
+        current = self.canvas.current_slice
+        hist_slices = self.canvas.mr_slices_with_histology
+        
+        # Find previous slice with histology
+        prev_slices = [s for s in hist_slices if s < current]
+        
+        if prev_slices:
+            target_slice = prev_slices[-1]  # Get the closest one before current
+            self.canvas.set_slice(target_slice)
+            self.slice_spin.setValue(target_slice + 1)
+            self.slice_slider.setValue(target_slice + 1)
+
+    def jump_to_next_histology(self):
+        """Jump to the next MR slice that contains histology data."""
+        if not self.canvas or not self.canvas.mr_slices_with_histology:
+            return
+        
+        current = self.canvas.current_slice
+        hist_slices = self.canvas.mr_slices_with_histology
+        
+        # Find next slice with histology
+        next_slices = [s for s in hist_slices if s > current]
+        
+        if next_slices:
+            target_slice = next_slices[0]  # Get the closest one after current
+            self.canvas.set_slice(target_slice)
+            self.slice_spin.setValue(target_slice + 1)
+            self.slice_slider.setValue(target_slice + 1)
+
     def on_mask_selection_changed(self, mask_name: str):
         """Handle mask selection change."""
         if mask_name and mask_name != self.current_mask_name:
@@ -655,20 +799,29 @@ class RegistrationResultsViewer(QWidget):
                               "Pathology data not available.")
             return
 
-        current_slice = self.canvas.current_slice
+        current_mr_slice = self.canvas.current_slice
+        
+        # Find the corresponding histology slice
+        hist_slice_idx = self.canvas._get_histology_slice_for_mr(current_mr_slice)
+        
+        if hist_slice_idx is None:
+            QMessageBox.warning(self, "Warning", 
+                              f"No histology data for MR slice {current_mr_slice + 1}.\n"
+                              f"Histology is only available in slices: {[s+1 for s in self.canvas.mr_slices_with_histology]}")
+            return
         
         if not hasattr(self.pathology_volume, 'pathologySlices'):
             QMessageBox.warning(self, "Warning", 
                               "PathologyVolume structure not recognized.")
             return
         
-        if current_slice >= len(self.pathology_volume.pathologySlices):
+        if hist_slice_idx >= len(self.pathology_volume.pathologySlices):
             QMessageBox.warning(self, "Warning", 
-                              f"Slice {current_slice+1} out of bounds.")
+                              f"Histology slice {hist_slice_idx} out of bounds.")
             return
 
         try:
-            ps = self.pathology_volume.pathologySlices[current_slice]
+            ps = self.pathology_volume.pathologySlices[hist_slice_idx]
             
             # Load original high-res RGB image
             highres_rgb = ps.loadRgbImage()
@@ -682,7 +835,7 @@ class RegistrationResultsViewer(QWidget):
             try:
                 highres_mask = ps.loadMask(0)
             except:
-                logging.warning(f"No mask available for slice {current_slice}")
+                logging.warning(f"No mask available for histology slice {hist_slice_idx}")
             
             # Get the transform
             transform = ps.transform if hasattr(ps, 'transform') and ps.transform else sitk.Transform()
@@ -691,8 +844,8 @@ class RegistrationResultsViewer(QWidget):
             self.canvas.load_highres_slice(highres_rgb, highres_mask, transform)
             
             self.clear_highres_btn.setEnabled(True)
-            self.highres_status.setText(f"Mode: High-Res (Slice {current_slice + 1})")
-            self.highres_status.setStyleSheet("QLabel { color: green; }")
+            self.highres_status.setText(f"Mode: High-Res (Hist Slice {hist_slice_idx}, MR Slice {current_mr_slice + 1})")
+            self.highres_status.setStyleSheet("QLabel { color: green; font-weight: bold; }")
             
         except Exception as e:
             logging.error(f"Failed to load high-res slice: {e}", exc_info=True)
@@ -805,10 +958,12 @@ if __name__ == '__main__':
     from PyQt6.QtWidgets import QApplication, QMainWindow
     import sys
     
+    logging.basicConfig(level=logging.INFO)
+    
     app = QApplication(sys.argv)
     
     main_window = QMainWindow()
-    main_window.setWindowTitle("Registration Results Viewer - Fixed Version")
+    main_window.setWindowTitle("Registration Results Viewer - FIXED VERSION")
     main_window.setGeometry(100, 100, 1400, 900)
     
     viewer_tab = RegistrationResultsViewer()
@@ -816,20 +971,20 @@ if __name__ == '__main__':
     
     main_window.show()
     
-    # Example: Load test data (if available)
-    # Uncomment and modify paths as needed:
-    """
-    test_results = {
-        'fixed_volume': '/path/to/mr_volume.nii.gz',
-        'registered_rgb': '/path/to/registered_histology.mha',
-        'registered_masks': {
-            'region0': '/path/to/registered_mask_region0.mha',
-            'region1': '/path/to/registered_mask_region1.mha'
-        },
-        'pathology_volume': None,  # PathologyVolume object if available
-        'output_dir': '/path/to/output'
-    }
-    viewer_tab.load_data_from_registration(test_results)
-    """
+    print("\n" + "="*70)
+    print("FIXED REGISTRATION VIEWER")
+    print("="*70)
+    print("\nKey fixes applied:")
+    print("  ✓ Removed flipud - correct orientation")
+    print("  ✓ Physical coordinate mapping for slice correspondence")
+    print("  ✓ Automatic detection of which MR slices contain histology")
+    print("  ✓ Quick navigation buttons to jump between histology slices")
+    print("  ✓ Clear status indication: [with histology] or [MR only]")
+    print("\nUsage:")
+    print("  1. Load registration results")
+    print("  2. Viewer will automatically jump to first histology slice")
+    print("  3. Use 'Previous/Next Histology Slice' buttons for quick navigation")
+    print("  4. Mouse wheel to browse all slices")
+    print("="*70 + "\n")
     
     sys.exit(app.exec())

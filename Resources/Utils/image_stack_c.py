@@ -7,7 +7,7 @@ import os
 import json
 import numpy as np
 import SimpleITK as sitk
-from image_registration import RegisterImages
+from Resources.Utils.image_registration import RegisterImages
 
 
 class PathologyVolume:
@@ -1122,6 +1122,39 @@ class PathologySlice:
         if self.do_affine:
             fixed_image_input = sitk.Cast(fixed_image > 0, sitk.sitkFloat32) * 255
             moving_image_input = sitk.Cast(moving_image > 0, sitk.sitkFloat32) * 255
+
+            # Calcola le statistiche per verificare se le immagini sono vuote
+            stats_fixed = sitk.StatisticsImageFilter()
+            stats_fixed.Execute(fixed_image_input)
+            
+            stats_moving = sitk.StatisticsImageFilter()
+            stats_moving.Execute(moving_image_input)
+            
+            print(f"DEBUG SLICE {idx}: Fixed Input Stats  - Max: {stats_fixed.GetMaximum()}, Sum: {stats_fixed.GetSum()}")
+            print(f"DEBUG SLICE {idx}: Moving Input Stats - Max: {stats_moving.GetMaximum()}, Sum: {stats_moving.GetSum()}")
+
+            # Se una delle due immagini è completamente vuota, salta la registrazione o solleva un errore informativo
+            if stats_fixed.GetSum() == 0.0:
+                print(f"⚠️ WARNING: Slice {idx} - Fixed image input for registration is completely black. Skipping registration for this slice.")
+                # Se l'immagine è vuota, non c'è nulla da registrare. Restituiamo la trasformazione che avevamo.
+                # Non si può procedere. Potresti voler semplicemente ritornare, o gestire l'errore.
+                # Per ora, continuiamo per vedere se l'altra immagine causa problemi.
+            
+            if stats_moving.GetSum() == 0.0:
+                print(f"⚠️ WARNING: Slice {idx} - Moving image input for registration is completely black. Skipping registration for this slice.")
+                # Anche qui, non si può procedere.
+            
+            # Aggiungiamo un controllo più robusto: se una delle due è vuota, non fare nulla.
+            if stats_fixed.GetSum() == 0.0 or stats_moving.GetSum() == 0.0:
+                print(f"ERROR: Cannot perform registration for slice {idx} because one of the images is empty.")
+                # In questo caso, potresti voler saltare la slice. Se ritorni, la trasformazione non verrà aggiornata.
+                return # Esce dal metodo senza fare la registrazione per questa slice
+            
+            # Salva le immagini per un'ispezione visiva (molto utile!)
+            if self.verbose:
+                sitk.WriteImage(fixed_image_input, f"debug_{idx:02d}_fixed_input.nii.gz")
+                sitk.WriteImage(moving_image_input, f"debug_{idx:02d}_moving_input.nii.gz")
+    # ==========================================================
             
             # Rigid registration (2 passes)
             self.transform = reg.RegisterAffine(

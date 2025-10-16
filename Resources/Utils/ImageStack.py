@@ -1,13 +1,14 @@
-#inserimento distanza fette su JSON
-
 import os
 import json
 import numpy as np
 import SimpleITK as sitk
 from Resources.Utils.image_registration import RegisterImages
 
-class PathologyVolume:
+#questo file è giusto
 
+
+class PathologyVolume:
+    
     def __init__(self, parent=None):
         self.verbose = False
         self.path = None
@@ -15,43 +16,47 @@ class PathologyVolume:
         self.noRegions = 0
         self.regionIDs = None
         self.noSlices = 0
-        # in micrometers
         self.pix_size_x = 0
         self.pix_size_y = 0
 
-        # max image size
         self.maxSliceSize = [0, 0]
         self.volumeSize = [0, 0, 0]
         self.rgbVolume = None
         self.storeVolume = False
 
         self.inPlaneScaling = 1.2
-         
         self.pathologySlices = None
-        
         self.jsonDict = None
         
-        # NEW: Distance and thickness parameters
-        self.rectumDistance = 0.0  # Distance from rectum in mm
-        self.totalVolumeThickness = 0.0  # Total thickness of all slices in mm
-        self.slicePositions = []  # Z positions for each slice
-        
-        # filenames if needed to load here
-        self.imagingContraintFilename = None
-        self.imagingContraintMaskFilename = None
+        # Distance and thickness parameters
+        self.rectumDistance = 0.0
+        self.totalVolumeThickness = 0.0
+        self.slicePositions = []
         
         # files 
         self.imagingContraint = None
         self.imagingContraintMask = None
         
+        # CRITICAL: Physical space parameters
         self.volumeOrigin = None
         self.volumeDirection = None
         self.volumeSpacing = None
         
+        # Physical space alignment from MRI constraint
+        self.constraintRegion = None
+        self.targetPhysicalSize = None
+        
+        # NEW: Labelmap association
+        self.mri_labelmap = None  # The MRI segmentation as labelmap
+        self.slice_to_label_map = {}  # Maps histology slice index to MRI label value
+        self.label_to_slice_map = {}  # Maps MRI label value to histology slice index
+        
+        # Reference volumes
         self.refWoContraints = None
         self.refWContraints = None
         self.mskRefWoContraints = None
         self.mskRefWContraints = None
+        
         self.doAffine = True
         self.doDeformable = None
         self.doReconstruct = None
@@ -63,6 +68,12 @@ class PathologyVolume:
     def set_verbose(self, verbose):
         """Set verbose mode"""
         self.verbose = verbose
+    
+    def setPath(self, path):
+        """Set the path to the JSON file"""
+        self.path = path
+        if self.verbose:
+            print(f"Pathology JSON path set to: {path}")
     
     def setRectumDistance(self, distance_mm):
         """Set the distance from rectum where histological slices will be placed"""
@@ -76,7 +87,7 @@ class PathologyVolume:
             return
             
         self.slicePositions = []
-        current_z = self.rectumDistance  # Start from rectum distance
+        current_z = self.rectumDistance
         
         for i, ps in enumerate(self.pathologySlices):
             self.slicePositions.append(current_z)
@@ -85,7 +96,6 @@ class PathologyVolume:
             if self.verbose:
                 print(f"Slice {i} positioned at Z = {current_z} mm (thickness: {ps.sliceThickness} mm)")
             
-            # Move to next slice position
             current_z += ps.sliceThickness
             
         self.totalVolumeThickness = current_z - self.rectumDistance
@@ -93,11 +103,303 @@ class PathologyVolume:
         if self.verbose:
             print(f"Total volume thickness: {self.totalVolumeThickness} mm")
     
+    def extractConstraintRegionWithLabels(self, mri_volume, mri_labelmap):
+        """
+        Extract constraint region from MRI PRESERVING LABELMAP STRUCTURE
+        This is critical for slice-to-slice association
+        
+        Args:
+            mri_volume: MRI T2 volume
+            mri_labelmap: MRI segmentation as labelmap (with distinct label values per slice)
+        
+        Returns:
+            Tuple of (constrained_volume, constrained_labelmap, bbox, label_to_z_map)
+        """
+        if self.verbose:
+            print("Extracting constraint region WITH LABELMAP preservation...")
+        
+        # Store the original labelmap
+        self.mri_labelmap = mri_labelmap
+        
+        # Get bounding box from labelmap
+        stats_filter = sitk.LabelShapeStatisticsImageFilter()
+        
+        # Create binary mask from all labels
+        binary_mask = mri_labelmap != 0
+        connected = sitk.ConnectedComponent(binary_mask)
+        stats_filter.Execute(connected)
+        
+        labels = stats_filter.GetLabels()
+        if not labels:
+            raise ValueError("Labelmap is empty")
+        
+        label = labels[0]
+        bounding_box = stats_filter.GetBoundingBox(label)
+        
+        # Extract ROI from both volume and labelmap
+        roi_filter = sitk.RegionOfInterestImageFilter()
+        roi_filter.SetSize([bounding_box[3], bounding_box[4], bounding_box[5]])
+        roi_filter.SetIndex([bounding_box[0], bounding_box[1], bounding_box[2]])
+        
+        constrained_volume = roi_filter.Execute(mri_volume)
+        constrained_labelmap = roi_filter.Execute(mri_labelmap)
+        
+        # Analyze labelmap structure to map Z-slices to labels
+        label_to_z_map = self.analyzeLabelmap(constrained_labelmap, bounding_box)
+        
+        self.constraintRegion = bounding_box
+        
+        if self.verbose:
+            print(f"Constraint region extracted:")
+            print(f"  Bounding box: {bounding_box}")
+            print(f"  Physical size: {constrained_volume.GetSize()}")
+            print(f"  Number of labeled slices: {len(label_to_z_map)}")
+            print(f"  Labels found: {sorted(label_to_z_map.keys())}")
+        
+        return constrained_volume, constrained_labelmap, bounding_box, label_to_z_map
+    
+    def analyzeLabelmap(self, labelmap, bounding_box):
+        """
+        Analyze labelmap to determine which labels are present in which Z-slices
+        
+        Args:
+            labelmap: The constrained labelmap volume
+            bounding_box: Bounding box coordinates
+        
+        Returns:
+            Dictionary mapping label_value -> list of z_indices where that label appears
+        """
+        if self.verbose:
+            print("\nAnalyzing labelmap structure...")
+        
+        label_to_z_map = {}
+        labelmap_array = sitk.GetArrayFromImage(labelmap)  # Shape: [Z, Y, X]
+        
+        # For each Z slice
+        for z_idx in range(labelmap_array.shape[0]):
+            slice_2d = labelmap_array[z_idx, :, :]
+            unique_labels = np.unique(slice_2d)
+            
+            # Remove background (0)
+            unique_labels = unique_labels[unique_labels != 0]
+            
+            for label_value in unique_labels:
+                if label_value not in label_to_z_map:
+                    label_to_z_map[label_value] = []
+                label_to_z_map[label_value].append(z_idx)
+        
+        if self.verbose:
+            print(f"  Found {len(label_to_z_map)} distinct labels")
+            for label_val, z_indices in sorted(label_to_z_map.items()):
+                print(f"    Label {int(label_val)}: appears in {len(z_indices)} slices "
+                      f"(Z indices: {min(z_indices)}-{max(z_indices)})")
+        
+        return label_to_z_map
+    
+    def createSliceToLabelMapping(self, label_to_z_map, num_histology_slices):
+        """
+        Create mapping between histology slices and MRI labels
+        
+        Strategy:
+        - If MRI has one label per slice: 1-to-1 mapping
+        - If MRI has fewer labels than histology slices: distribute histology across labels
+        - If MRI has more labels: map multiple labels to one histology slice
+        
+        Args:
+            label_to_z_map: Dictionary from analyzeLabelmap
+            num_histology_slices: Number of histology slices to register
+        """
+        if self.verbose:
+            print(f"\nCreating slice-to-label mapping...")
+            print(f"  Histology slices: {num_histology_slices}")
+            print(f"  MRI labels: {len(label_to_z_map)}")
+        
+        # Get sorted list of labels
+        sorted_labels = sorted(label_to_z_map.keys())
+        
+        if len(sorted_labels) == num_histology_slices:
+            # Perfect 1-to-1 mapping
+            for i, label_val in enumerate(sorted_labels):
+                self.slice_to_label_map[i] = int(label_val)
+                self.label_to_slice_map[int(label_val)] = i
+            
+            if self.verbose:
+                print("  Using 1-to-1 mapping (equal number of slices and labels)")
+        
+        elif len(sorted_labels) > num_histology_slices:
+            # More labels than histology slices - group labels
+            # Distribute labels evenly across histology slices
+            labels_per_slice = len(sorted_labels) / num_histology_slices
+            
+            for hist_idx in range(num_histology_slices):
+                start_idx = int(hist_idx * labels_per_slice)
+                end_idx = int((hist_idx + 1) * labels_per_slice)
+                
+                # Assign the middle label from this range
+                mid_idx = (start_idx + end_idx) // 2
+                label_val = sorted_labels[mid_idx]
+                
+                self.slice_to_label_map[hist_idx] = int(label_val)
+                self.label_to_slice_map[int(label_val)] = hist_idx
+            
+            if self.verbose:
+                print(f"  Using grouped mapping (more labels than slices)")
+                print(f"  Labels per histology slice: ~{labels_per_slice:.1f}")
+        
+        else:
+            # Fewer labels than histology slices - interpolate
+            # Distribute histology slices across available labels
+            for hist_idx in range(num_histology_slices):
+                # Map to nearest label
+                label_idx = int(hist_idx * len(sorted_labels) / num_histology_slices)
+                label_idx = min(label_idx, len(sorted_labels) - 1)
+                
+                label_val = sorted_labels[label_idx]
+                self.slice_to_label_map[hist_idx] = int(label_val)
+                
+                # Multiple histology slices may map to same label
+                if int(label_val) not in self.label_to_slice_map:
+                    self.label_to_slice_map[int(label_val)] = []
+                if isinstance(self.label_to_slice_map[int(label_val)], list):
+                    self.label_to_slice_map[int(label_val)].append(hist_idx)
+                else:
+                    self.label_to_slice_map[int(label_val)] = [
+                        self.label_to_slice_map[int(label_val)], hist_idx
+                    ]
+            
+            if self.verbose:
+                print(f"  Using interpolated mapping (fewer labels than slices)")
+        
+        if self.verbose:
+            print("\n  Final mapping:")
+            for hist_idx in range(min(num_histology_slices, 10)):  # Show first 10
+                label_val = self.slice_to_label_map.get(hist_idx, "N/A")
+                print(f"    Histology slice {hist_idx} → MRI label {label_val}")
+            if num_histology_slices > 10:
+                print(f"    ... ({num_histology_slices - 10} more)")
+    
+    def alignToMRISpace(self, mri_volume, mri_labelmap):
+        """
+        Aligns the histology volume's physical space to the MRI constraint region
+        WITH LABELMAP ASSOCIATION
+        """
+        if self.verbose:
+            print("\n" + "="*70)
+            print("ALIGNING HISTOLOGY PHYSICAL SPACE TO MRI WITH LABELMAP")
+            print("="*70)
+
+        if not mri_volume or not mri_labelmap:
+            raise ValueError("MRI volume and labelmap are required for alignment.")
+
+        # Extract constraint region PRESERVING LABELMAP
+        constrained_mri, constrained_labelmap, bbox, label_to_z_map = \
+            self.extractConstraintRegionWithLabels(mri_volume, mri_labelmap)
+        
+        # Create slice-to-label mapping
+        self.createSliceToLabelMapping(label_to_z_map, self.noSlices)
+        
+        # Update physical properties to match MRI
+        self.volumeOrigin = constrained_mri.GetOrigin()
+        self.volumeSpacing = constrained_mri.GetSpacing()
+        self.volumeDirection = constrained_mri.GetDirection()
+        self.volumeSize = list(constrained_mri.GetSize())
+        
+        # Z-size matches number of histology slices
+        self.volumeSize[2] = self.noSlices
+        
+        # Store target physical size
+        mri_phys_size = [
+            constrained_mri.GetSize()[i] * constrained_mri.GetSpacing()[i] 
+            for i in range(3)
+        ]
+        self.targetPhysicalSize = mri_phys_size
+
+        if self.verbose:
+            print("Histology physical space aligned to MRI:")
+            print(f"  New Origin:    {self.volumeOrigin}")
+            print(f"  New Spacing:   {self.volumeSpacing}")
+            print(f"  New Size:      {self.volumeSize}")
+            print(f"  Slice-to-label mapping created: {len(self.slice_to_label_map)} associations")
+            print("="*70 + "\n")
+    
+    def createInitialHistologyVolume(self):
+        """Create initial histology volume in its OWN coordinate system"""
+        if self.verbose:
+            print("\nCreating initial histology volume in histology space...")
+        
+        # Calculate histology spacing
+        hist_spacing_x = self.pix_size_x / 1000.0 if self.pix_size_x > 0 else 1.0
+        hist_spacing_y = self.pix_size_y / 1000.0 if self.pix_size_y > 0 else 1.0
+        
+        if len(self.slicePositions) > 1:
+            hist_spacing_z = abs(self.slicePositions[1] - self.slicePositions[0])
+        elif self.pathologySlices and len(self.pathologySlices) > 0:
+            hist_spacing_z = self.pathologySlices[0].sliceThickness
+        else:
+            hist_spacing_z = 1.0
+        
+        if hist_spacing_z <= 1e-6:
+            hist_spacing_z = 1.0
+        
+        # Calculate volume size
+        hist_size_x = int(self.maxSliceSize[0] * self.inPlaneScaling)
+        hist_size_y = int(self.maxSliceSize[1] * self.inPlaneScaling)
+        hist_size_z = self.noSlices
+        
+        # Create volume
+        self.volumeSpacing = [hist_spacing_x, hist_spacing_y, hist_spacing_z]
+        self.volumeOrigin = [0.0, 0.0, self.rectumDistance]
+        self.volumeDirection = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        self.volumeSize = [hist_size_x, hist_size_y, hist_size_z]
+        
+        if self.verbose:
+            print(f"Initial histology volume:")
+            print(f"  Size: {self.volumeSize}")
+            print(f"  Spacing: {self.volumeSpacing} mm")
+    
+    def resampleHistologyToMRISpace(self, mri_constraint_volume, hist_rgb_volume, 
+                                    hist_mask_volume=None):
+        """Resample histology volume to MRI physical space"""
+        if self.verbose:
+            print("\n" + "="*70)
+            print("RESAMPLING HISTOLOGY TO MRI PHYSICAL SPACE")
+            print("="*70)
+        
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(mri_constraint_volume)
+        resampler.SetTransform(sitk.Transform())
+        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetDefaultPixelValue(255)
+        
+        resampled_rgb = resampler.Execute(hist_rgb_volume)
+        
+        resampled_mask = None
+        if hist_mask_volume is not None:
+            resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+            resampler.SetDefaultPixelValue(0)
+            resampled_mask = resampler.Execute(hist_mask_volume)
+        
+        if self.verbose:
+            print(f"✓ Resampling complete")
+            print(f"  Output size: {resampled_rgb.GetSize()}")
+            print("="*70 + "\n")
+        
+        return resampled_rgb, resampled_mask
+    
+    def getTargetLabelForSlice(self, histology_slice_index):
+        """
+        Get the MRI label value that should be associated with this histology slice
+        
+        Args:
+            histology_slice_index: Index of histology slice
+            
+        Returns:
+            MRI label value (integer)
+        """
+        return self.slice_to_label_map.get(histology_slice_index, 0)
+    
     def initComponents(self):
-        """
-        Reads json and identifies size needed for output volume; 
-        Does NOT Read the actual images; Does NOT Create the volume
-        """
+        """Initialize components from JSON"""
         if self.verbose:
             print("PathologyVolume: Initialize components") 
 
@@ -106,9 +408,6 @@ class PathologyVolume:
             self.successfulInitialization = False
             return False
 
-        if self.verbose:
-            print("PathologyVolume: Loading from", self.path)
-        
         try:
             with open(self.path, 'r') as f:
                 data = json.load(f)
@@ -119,19 +418,14 @@ class PathologyVolume:
             
         self.jsonDict = data
         
-        # NEW: Read rectum distance from JSON if available
+        # Read rectum distance from JSON if available
         if 'volume_settings' in data and 'rectum_distance_mm' in data['volume_settings']:
             self.rectumDistance = float(data['volume_settings']['rectum_distance_mm'])
-            if self.verbose:
-                print(f"Rectum distance loaded from JSON: {self.rectumDistance} mm")
 
         self.pix_size_x = 0
         self.pix_size_y = 0
-
         self.pathologySlices = []
         self.regionIDs = []
-
-        print("Processing slices:", np.sort(list(self.jsonDict.keys())))
         
         slice_keys = [k for k in self.jsonDict.keys() if k != 'volume_settings']
         
@@ -142,98 +436,54 @@ class PathologyVolume:
                 ps.rgbImageFn = data[key]['filename']
                 ps.maskDict = data[key]['regions']
                 ps.id = data[key]['id']
-                
-                # NEW: Read slice thickness
                 ps.sliceThickness = float(data[key].get('slice_thickness_mm', 1.0))
-                if self.verbose:
-                    print(f"Slice {key} thickness: {ps.sliceThickness} mm")
                 
+                # Handle transforms
                 ps.doFlip = None
                 ps.doRotate = None
                 
-                if self.verbose:
-                    print(f"Processing slice {key}: {data[key].get('transform', 'No transform info')}")
-                
-                if 'transform' in data[key]:  # new format
+                if 'transform' in data[key]:
                     ps.transformDict = data[key]['transform']
-                    if 'flip' in ps.transformDict:
-                        ps.doFlip = ps.transformDict['flip']
-                    if 'rotation_angle' in ps.transformDict:
-                        ps.doRotate = ps.transformDict['rotation_angle']
+                    ps.doFlip = ps.transformDict.get('flip')
+                    ps.doRotate = ps.transformDict.get('rotation_angle')
                 else:
-                    if 'flip' in data[key]:
-                        ps.doFlip = int(data[key]['flip']) 
-                    if 'rotate' in data[key]:
-                        ps.doRotate = data[key].get('rotate', None)
-                        
-                # if flip and rotate were not found at all, then just set them to 0, aka do nothing
+                    ps.doFlip = data[key].get('flip', 0)
+                    ps.doRotate = data[key].get('rotate', 0)
+                
                 if ps.doFlip is None: 
-                    if self.verbose:
-                        print("Setting default parameters")
                     ps.doFlip = 0
                 if ps.doRotate is None:
                     ps.doRotate = 0
                     
-                # Load image size
                 if not ps.loadImageSize():
                     print(f"WARNING: Failed to load image size for slice {key}")
                     continue
                     
                 size = ps.rgbImageSize
 
-                for dim in range(min(ps.dimension, 2)):  # Only consider 2D dimensions
-                    if self.verbose:
-                        print(f"DEBUG: self.maxSliceSize = {self.maxSliceSize}")
-                        print(f"DEBUG: size = {size}")
-                        print(f"DEBUG: dim = {dim}")
+                for dim in range(min(ps.dimension, 2)):
                     if len(self.maxSliceSize) > dim and len(size) > dim:
                         if self.maxSliceSize[dim] < size[dim]:
                             self.maxSliceSize[dim] = size[dim]
 
-                idx = data[key].get('slice_number', None)
-                if idx:
-                    # assumes numbering in the json file starting from 1
-                    # but in python starts at 0
-                    ps.refSliceIdx = int(idx) - 1
-                else:
-                    ps.refSliceIdx = len(self.pathologySlices)
+                idx = data[key].get('slice_number')
+                ps.refSliceIdx = int(idx) - 1 if idx else len(self.pathologySlices)
                 
                 for r in list(data[key]['regions']):
                     if r not in self.regionIDs:
                         self.regionIDs.append(r)
                 self.noRegions = len(self.regionIDs)
                 
-                # set the list with region ID so the slice knows what ids to assign to
-                # regions that are global
                 ps.regionIDs = self.regionIDs
-                
                 self.pathologySlices.append(ps)
 
-                # Process resolution information
-                xml_res_x = None
-                if 'resolution_x_um' in data[key]:
-                    xml_res_x = float(data[key]['resolution_x_um'])
-                elif 'resolution_x' in data[key]:
-                    xml_res_x = float(data[key]['resolution_x'])                   
-                if xml_res_x is None:
-                    xml_res_x = 0
-
-                xml_res_y = None
-                if 'resolution_y_um' in data[key]:
-                    xml_res_y = float(data[key]['resolution_y_um'])
-                elif 'resolution_y' in data[key]:
-                    xml_res_y = float(data[key]['resolution_y'])                   
-                if xml_res_y is None:
-                    xml_res_y = 0
-
+                # Process resolution
+                xml_res_x = data[key].get('resolution_x_um', data[key].get('resolution_x', 0))
+                xml_res_y = data[key].get('resolution_y_um', data[key].get('resolution_y', 0))
+                
                 if self.pix_size_x == 0 and xml_res_x > 0:
                     self.pix_size_x = xml_res_x
                 if self.pix_size_y == 0 and xml_res_y > 0:
-                    self.pix_size_y = xml_res_y
-                    
-                if xml_res_x > 0 and self.pix_size_x > xml_res_x:
-                    self.pix_size_x = xml_res_x
-                if xml_res_y > 0 and self.pix_size_y > xml_res_y:
                     self.pix_size_y = xml_res_y
                     
             except Exception as e:
@@ -247,116 +497,31 @@ class PathologyVolume:
             self.successfulInitialization = False
             return False
         
-        # NEW: Calculate slice positions based on thickness
+        # Calculate slice positions
         self.calculateSlicePositions()
         
-        self.volumeSize = [int(self.maxSliceSize[0] * self.inPlaneScaling),
-                          int(self.maxSliceSize[1] * self.inPlaneScaling), 
-                          self.noSlices]
+        # Create initial volume parameters
+        self.createInitialHistologyVolume()
 
         if self.verbose:
-            print("PathologyVolume: Found {:d} slices @ max size {}".format(self.noSlices,
-                self.maxSliceSize))
-            print("PathologyVolume: Create volume at {}".format(self.volumeSize))
-            print(f"PathologyVolume: Total volume thickness: {self.totalVolumeThickness} mm")
+            print(f"Found {self.noSlices} slices @ max size {self.maxSliceSize}")
+            print(f"Initial volume size: {self.volumeSize}")
         
         self.successfulInitialization = True
         return True
 
-    #
-# FIXED AND ROBUST VERSION
-#
-    def updateVolumeSpacing(self):
-        """Update volume spacing based on slice positions and pixel sizes, ensuring Z-spacing is never zero."""
+    def loadRgbVolume(self):
+        """Load the RGB volume from pathology slices"""
         if not self.pathologySlices:
-            if self.verbose:
-                print("Warning: Cannot update volume spacing, no pathology slices loaded.")
-            return
-
-        # --- Calculate Z-spacing ---
-        z_spacing = 0.0
-        if self.noSlices > 1:
-            # The most reliable method: calculate spacing from the Z-position of the first two slices.
-            # Ensure slice positions have been calculated.
-            if len(self.slicePositions) > 1:
-                z_spacing = abs(self.slicePositions[1] - self.slicePositions[0])
-            else:
-                # Fallback if slicePositions isn't ready for some reason
-                z_spacing = abs(self.pathologySlices[1].zPosition - self.pathologySlices[0].zPosition)
-            
-            # If the positions are identical (z_spacing is zero), fall back to the slice thickness.
-            if z_spacing < 1e-6: # Use a small tolerance for floating point comparison
-                if self.verbose:
-                    print("Warning: Z-positions of first two slices are identical. Using first slice's thickness as Z-spacing.")
-                z_spacing = self.pathologySlices[0].sliceThickness
+            raise RuntimeError("No pathology slices available")
         
-        elif self.noSlices == 1:
-            # For a single slice, its "thickness" is its Z-dimension spacing.
-            if self.verbose:
-                print("Info: Only one slice found. Using its thickness as Z-spacing.")
-            z_spacing = self.pathologySlices[0].sliceThickness
-
-        # --- FINAL SAFETY CHECK ---
-        # If, after all of the above, z_spacing is still zero or negative, default to 1.0 to prevent crashing.
-        if z_spacing <= 1e-6:
-            if self.verbose:
-                print(f"CRITICAL WARNING: Calculated Z-spacing is {z_spacing}. This is invalid. Defaulting to 1.0 to prevent error.")
-            z_spacing = 1.0
-
-        # --- Calculate X and Y spacing ---
-        x_spacing = self.pix_size_x / 1000.0 if self.pix_size_x > 0 else 1.0
-        y_spacing = self.pix_size_y / 1000.0 if self.pix_size_y > 0 else 1.0
-        
-        self.volumeSpacing = [x_spacing, y_spacing, z_spacing]
-        
-        if self.verbose:
-            print(f"Volume spacing set to: {self.volumeSpacing} mm")
-            
-    def printTransform(self, ref=None):
-        """Print transforms for debugging"""
-        if self.pathologySlices:
-            for i, ps in enumerate(self.pathologySlices):
-                print(f"Slice {i}: Z={getattr(ps, 'zPosition', 'N/A')} mm, "
-                      f"thickness={getattr(ps, 'sliceThickness', 'N/A')} mm, "
-                      f"transform={getattr(ps, 'transform', 'No transform')}")
-
-    def setPath(self, path):
-        """Set the path to the JSON file"""
-        self.path = path
-
-    def loadRgbVolume(self): 
-        """Load the RGB volume from pathology slices with proper Z spacing"""
-        if self.verbose:
-            print("Loading RGB Volume with slice thickness information")
-            
-        if not self.pathologySlices:
-            raise RuntimeError("No pathology slices available. Call initComponents() first.")
-        
-        # Update volume spacing based on slice positions
-        self.updateVolumeSpacing()
-            
-        # create new volume with white background
         vol = sitk.Image(self.volumeSize, sitk.sitkVectorUInt8, 3)
-        if self.volumeOrigin:
-            vol.SetOrigin(self.volumeOrigin)
-        else:
-            # Set origin based on rectum distance
-            vol.SetOrigin([0, 0, self.rectumDistance])
-            
-        if self.volumeDirection:
-            vol.SetDirection(self.volumeDirection)
-        else:
-            vol.SetDirection([1, 0, 0, 0, 1, 0, 0, 0, 1])  # Identity direction
-            
-        if self.volumeSpacing:
-            vol.SetSpacing(self.volumeSpacing)
+        vol.SetOrigin(self.volumeOrigin)
+        vol.SetDirection(self.volumeDirection)
+        vol.SetSpacing(self.volumeSpacing)
 
-        # fill the volume
         for i, ps in enumerate(self.pathologySlices):
             try:
-                if self.verbose:
-                    print(f"Loading slice {i} at Z position {ps.zPosition} mm")
-                
                 ps.fastExecution = self.fastExecution
                 im = ps.loadRgbImage()
                 
@@ -367,7 +532,6 @@ class PathologyVolume:
                     ps.setReference(vol) 
                 
                 relativeIdx = int(i > 0)
-                ps.fastExecution = self.fastExecution
                 vol = ps.setTransformedRgb(vol, relativeIdx)
                 
             except Exception as e:
@@ -376,41 +540,35 @@ class PathologyVolume:
 
         if self.storeVolume:
             self.rgbVolume = vol
-            return self.rgbVolume
-        else:
-            return vol
+        
+        return vol
 
-    def loadMask(self, idxMask=0):
+    def loadMaskWithLabels(self, idxMask=0):
         """
-        Load all the masks from a certain region with proper Z spacing
+        Load mask AS LABELMAP with proper label values from MRI
+        Each histology slice gets its corresponding MRI label value
         """
         if not self.pathologySlices:
-            raise RuntimeError("No pathology slices available. Call initComponents() first.")
+            raise RuntimeError("No pathology slices available")
             
-        # Update volume spacing
-        self.updateVolumeSpacing()
+        # Create volume
+        vol = sitk.Image(self.volumeSize, sitk.sitkUInt16)  # Use UInt16 for labels
+        vol.SetOrigin(self.volumeOrigin)
+        vol.SetDirection(self.volumeDirection)
+        vol.SetSpacing(self.volumeSpacing)
+        
+        if self.verbose:
+            print(f"\nLoading mask {idxMask} AS LABELMAP...")
             
-        # create new volume
-        vol = sitk.Image(self.volumeSize, sitk.sitkUInt8)
-        if self.volumeOrigin:
-            vol.SetOrigin(self.volumeOrigin)
-        else:
-            vol.SetOrigin([0, 0, self.rectumDistance])
-            
-        if self.volumeDirection:
-            vol.SetDirection(self.volumeDirection)
-        else:
-            vol.SetDirection([1, 0, 0, 0, 1, 0, 0, 0, 1])
-            
-        if self.volumeSpacing:
-            vol.SetSpacing(self.volumeSpacing)
-            
-        # fill the volume
+        # Fill the volume with proper label values
         for i, ps in enumerate(self.pathologySlices):
             try:
-                if self.verbose:
-                    print(f"Loading mask {idxMask} for slice {i} at Z position {ps.zPosition} mm")
-                    
+                # Get the MRI label value for this slice
+                target_label = self.getTargetLabelForSlice(i)
+                
+                if self.verbose and i < 3:
+                    print(f"  Slice {i} → Label {target_label}")
+                
                 ps.fastExecution = self.fastExecution
                 im = ps.loadMask(idxMask)
                 
@@ -419,20 +577,108 @@ class PathologyVolume:
           
                 if not ps.refSize:
                     ps.setReference(vol)
-     
+                
+                # Set mask with correct label value
                 relativeIdx = int(i > 0)
-                vol = ps.setTransformedMask(vol, idxMask, relativeIdx)
+                vol = ps.setTransformedMaskWithLabel(vol, idxMask, relativeIdx, target_label)
                 
             except Exception as e:
                 print(f"ERROR: Failed to process mask for slice {i}: {e}")
                 continue
 
         return vol
+
+    def registerSlices(self, useImagingConstraint=True):
+        """Register slices with LABELMAP association"""
+        print("="*70)
+        print("REGISTER SLICES WITH LABELMAP ASSOCIATION")
+        print("="*70)
         
+        if not useImagingConstraint:
+            print("ERROR: Registration without imaging constraint not supported")
+            return
+        
+        if not self.imagingContraint or not self.imagingContraintMask:
+            print("ERROR: MRI volume and labelmap required")
+            return
+        
+        # STEP 1: Extract constraint WITH LABELMAP
+        print("\nStep 1: Extracting MRI constraint region WITH LABELMAP...")
+        constrained_mri, constrained_labelmap, bbox, label_to_z_map = \
+            self.extractConstraintRegionWithLabels(
+                self.imagingContraint,
+                self.imagingContraintMask
+            )
+        
+        # STEP 2: Create slice-to-label mapping
+        print("\nStep 2: Creating slice-to-label mapping...")
+        self.createSliceToLabelMapping(label_to_z_map, self.noSlices)
+        
+        # STEP 3: Load histology volumes
+        print("\nStep 3: Loading histology volumes...")
+        self.storeVolume = True
+        hist_rgb_native = self.loadRgbVolume()
+        hist_mask_native = self.loadMask(0)
+        
+        # STEP 4: Resample to MRI space
+        print("\nStep 4: Resampling histology to MRI space...")
+        hist_rgb_mri_space, hist_mask_mri_space = self.resampleHistologyToMRISpace(
+            constrained_mri,
+            hist_rgb_native,
+            hist_mask_native
+        )
+        
+        self.refWContraints = hist_rgb_mri_space
+        self.mskRefWContraints = hist_mask_mri_space
+        
+        # STEP 5: Register each slice to its corresponding label
+        print(f"\nStep 5: Registering slices to corresponding MRI labels...")
+        
+        for hist_idx in range(self.noSlices):
+            target_label = self.getTargetLabelForSlice(hist_idx)
+            
+            # Find which Z-slice(s) contain this label
+            z_indices_for_label = label_to_z_map.get(target_label, [])
+            
+            if not z_indices_for_label:
+                print(f"  ⚠️  Slice {hist_idx}: No Z-index found for label {target_label}")
+                continue
+            
+            # Use the middle Z-index if label spans multiple slices
+            target_z = z_indices_for_label[len(z_indices_for_label) // 2]
+            
+            print(f"\n  Registering histology slice {hist_idx+1} → MRI label {target_label} (Z={target_z})...")
+            
+            mov_ps = self.pathologySlices[hist_idx]
+            mov_ps.doAffine = self.doAffine
+            mov_ps.doDeformable = self.doDeformable
+            mov_ps.fastExecution = self.fastExecution
+            
+            # Extract the specific label as mask for registration
+            label_mask_3d = constrained_labelmap == target_label
+            label_mask_2d_slice = label_mask_3d[:, :, target_z]
+            
+            # Register
+            mov_ps.registerToConstraintWithLabel(
+                constrained_mri[:, :, target_z],
+                label_mask_2d_slice,
+                hist_rgb_mri_space,
+                hist_mask_mri_space,
+                hist_rgb_mri_space,
+                hist_mask_mri_space,
+                target_z,
+                target_label
+            )
+        
+        print("\n" + "="*70)
+        print("REGISTRATION WITH LABELMAP COMPLETE")
+        print("="*70)
+
+
+    # Rest of the methods remain the same
     def getInfo4UI(self):
-        """Get information for UI display including slice thickness"""
+        """Get information for UI display"""
         data = []
-        
         if not self.pathologySlices:
             return data
         
@@ -442,29 +688,28 @@ class PathologyVolume:
                 for mask_key in list(ps.maskDict):
                     fn = ps.maskDict[mask_key]['filename']
                     try:
-                        readIdxMask = int(mask_key[6:])  # Remove 'region' prefix
+                        readIdxMask = int(mask_key[6:])
                     except:
                         readIdxMask = 1
                     masks.append([readIdxMask, fn])
                     
             el = [idx,
-                ps.refSliceIdx + 1,  # start count from 1 in the UI
+                ps.refSliceIdx + 1,
                 ps.rgbImageFn, 
                 masks, 
                 ps.doFlip, 
                 ps.doRotate,
-                getattr(ps, 'sliceThickness', 1.0),  # NEW: slice thickness
-                getattr(ps, 'zPosition', 0.0)]  # NEW: Z position
+                getattr(ps, 'sliceThickness', 1.0),
+                getattr(ps, 'zPosition', 0.0)]
             data.append(el)
         
         return data
-        
+    
     def updateSlice(self, idx, param, value):
-        """Update slice parameters including slice thickness"""
+        """Update slice parameters"""
         if not self.pathologySlices or len(self.pathologySlices) <= idx:
             return
             
-        # the transform needs to be updated
         self.pathologySlices[idx].transform = None 
         jsonKey = False
         
@@ -486,25 +731,15 @@ class PathologyVolume:
         elif param == 'rotation_angle':
             self.pathologySlices[idx].doRotate = value
             jsonKey = True        
-            if self.verbose:
-                print(f'Rotating slice {idx} by {self.pathologySlices[idx].doRotate}')
             jsonValue = value
             
-        # NEW: Handle slice thickness updates
         elif param == 'slice_thickness_mm':
             self.pathologySlices[idx].sliceThickness = float(value)
             jsonKey = True
             jsonValue = float(value)
-            # Recalculate all slice positions when thickness changes
             self.calculateSlicePositions()
-            if self.verbose:
-                print(f'Updated slice {idx} thickness to {value} mm')
-            
-        if not jsonKey:
-            if self.verbose:
-                print(f"Adding new key {param}")
-                
-        # Update JSON dictionary
+        
+        # Update JSON
         if param in ['flip', 'rotation_angle']:
             if 'transform' not in self.jsonDict[self.pathologySlices[idx].jsonKey]:
                 self.jsonDict[self.pathologySlices[idx].jsonKey]['transform'] = {}
@@ -512,40 +747,10 @@ class PathologyVolume:
         else:
             self.jsonDict[self.pathologySlices[idx].jsonKey][param] = jsonValue
     
-    def updateRectumDistance(self, distance_mm):
-        """Update rectum distance and recalculate slice positions"""
-        self.setRectumDistance(distance_mm)
-        self.calculateSlicePositions()
-        
-        # Update JSON with new rectum distance
-        if 'volume_settings' not in self.jsonDict:
-            self.jsonDict['volume_settings'] = {}
-        self.jsonDict['volume_settings']['rectum_distance_mm'] = distance_mm
-        
-        if self.verbose:
-            print(f"Updated rectum distance to {distance_mm} mm")
-            
-    def updateSliceMask(self, idxSlice, idxMask, param, value):
-        """Update slice mask parameters"""
-        if not self.pathologySlices or len(self.pathologySlices) <= idxSlice:
-            return
-            
-        if param == 'key':
-            oldKey = f'region{idxMask}'
-            newKey = f'region{int(value)}'
-            if oldKey in self.pathologySlices[idxSlice].maskDict:
-                self.pathologySlices[idxSlice].maskDict[newKey] = self.pathologySlices[idxSlice].maskDict[oldKey]
-                del self.pathologySlices[idxSlice].maskDict[oldKey]
-                
-        elif param == 'filename':
-            mask_key = f'region{idxMask}'
-            if mask_key in self.pathologySlices[idxSlice].maskDict:
-                self.pathologySlices[idxSlice].maskDict[mask_key]['filename'] = value
-
     def saveJson(self, path_out_json):
-        """Save JSON configuration to file"""
+        """Save JSON configuration"""
         if self.verbose: 
-            print("Saving Json File with slice thickness information")
+            print("Saving Json File")
         
         try:
             with open(path_out_json, 'w') as outfile:
@@ -554,42 +759,7 @@ class PathologyVolume:
         except Exception as e:
             print(f"ERROR: Failed to save JSON: {e}")
             return False
-
-    def registerSlices(self, useImagingConstraint=False):
-        """Register slices (placeholder - main functionality preserved but simplified for UI compatibility)"""
-        print("Register Slices with slice thickness consideration")
-        
-        if not useImagingConstraint:
-            if (not self.doAffine and not self.doDeformable and not self.doReconstruct):
-                print("Nothing to be done as no reconstruction, no affine and no deformable were selected")
-                return
-                
-        print("Reconstruct?", self.doReconstruct)
-        
-        self.storeVolume = True
-
-        if useImagingConstraint:
-            print("Using imaging constraints not fully implemented in this UI version")
-            return
-        else:
-            if self.fastExecution:
-                print("Fast execution: Pathology reconstruction is not performed")
-                return
-                
-            if self.doReconstruct:
-                print("Performing reconstruction with slice thickness...")
-                try:
-                    ref = self.loadRgbVolume()
-                    refMask = self.loadMask(0)
-
-                    self.refWoContraints = ref
-                    self.mskRefWoContraints = refMask
-                    
-                    print("Reconstruction completed successfully with proper Z spacing")
-                    
-                except Exception as e:
-                    print(f"ERROR: Reconstruction failed: {e}")
-
+    
     def deleteData(self):
         """Clean up data"""
         print("Deleting Volume")
@@ -600,10 +770,8 @@ class PathologyVolume:
 
 
 class PathologySlice:
-    """
-    PathologySlice class with slice thickness support
-    """
-
+    """PathologySlice class with label association support"""
+    
     def __init__(self):
         self.verbose = False
         self.id = None
@@ -612,9 +780,11 @@ class PathologySlice:
         self.doFlip = None
         self.doRotate = None
         
-        # NEW: Slice thickness and position
-        self.sliceThickness = 1.0  # Default 1mm thickness
-        self.zPosition = 0.0  # Z position in volume
+        self.sliceThickness = 1.0
+        self.zPosition = 0.0
+        
+        # NEW: Label association
+        self.target_mri_label = None  # The MRI label this slice should match
 
         self.rgbImageSize = None
         self.rgbPixelType = None
@@ -622,24 +792,24 @@ class PathologySlice:
         self.rgbImage = None
         self.storeImage = False
 
-        # once the slice gets projected on the reference model, we have all this information
         self.transform = None
         self.refSize = None
         self.refSpacing = None
         self.refOrigin = None
         self.refDirection = None
-        self.refSliceIdx = None  # which slice in the reference volume
+        self.refSliceIdx = None
 
-        self.unitMode = 0  # 0-microns; 1-milimeters
-
+        self.unitMode = 0
         self.regionIDs = None
         self.doAffine = True
         self.doDeformable = None
         self.fastExecution = None
         self.runLonger = False
+        self.jsonKey = None
+        self.transformDict = None
 
     def loadImageSize(self):
-        """Load image size information without loading the full image"""
+        """Load image size information"""
         if not self.rgbImageFn:
             print("ERROR: The path to the rgb images was not set")
             return False
@@ -657,32 +827,23 @@ class PathologySlice:
             if self.verbose:
                 print(f"PathologySlice: Reading from '{self.rgbImageFn}'")
                 print(f"PathologySlice: Image Size: {self.rgbImageSize}")
-                print(f"PathologySlice: Thickness: {self.sliceThickness} mm")
                 
             return True
             
         except Exception as e:
-            print(f"ERROR: Failed to load image size for {self.rgbImageFn}: {e}")
+            print(f"ERROR: Failed to load image size: {e}")
             return False
-
-    # ... (rest of the PathologySlice methods remain the same as in original code)
     
     def loadRgbImage(self):
-        """Load RGB image with improved error handling"""
+        """Load RGB image"""
         if not self.rgbImageFn:
-            print("ERROR: The path to the rgb images was not set")
             return None
 
         try:
             rgbImage = sitk.ReadImage(str(self.rgbImageFn))
-                
         except Exception as e:
             print(f"ERROR: Couldn't read {self.rgbImageFn}: {e}")
             return None
-
-        if self.verbose:
-            print(f"PathologySlice: Reading {self.refSliceIdx} ({self.doFlip},{self.doRotate}) "
-                  f"thickness={self.sliceThickness}mm from '{self.rgbImageFn}'")
 
         # Apply flip if needed
         if (self.doFlip is not None) and self.doFlip == 1:
@@ -704,11 +865,10 @@ class PathologySlice:
             return rgbImage
     
     def getGrayFromRGB(self, im, invert=True):
-        """Convert RGB image to grayscale"""
+        """Convert RGB to grayscale"""
         try:
             select = sitk.VectorIndexSelectionCastImageFilter()
             
-            # Get individual channels
             select.SetIndex(0)
             im_gray = sitk.Cast(select.Execute(im), sitk.sitkFloat32) / 3
             
@@ -726,12 +886,10 @@ class PathologySlice:
         except Exception as e:
             print(f"ERROR: Failed to convert RGB to gray: {e}")
             return None
-
+    
     def loadMask(self, idxMask):
-        """Load mask with improved error handling and fixed SimpleITK syntax"""
+        """Load mask"""
         if not self.maskDict:
-            if self.verbose:
-                print("No mask information was provided")
             return None
 
         maskFn = None
@@ -739,22 +897,16 @@ class PathologySlice:
             fn = self.maskDict[mask_key]['filename']
             readIdxMask = 0
             
-            # Find the correct mask index
             for idxRegion, r in enumerate(self.regionIDs or []):
                 if mask_key == r:
                     readIdxMask = idxRegion
                     break
-            
-            if self.verbose:
-                print(f"PathologySlice: Mask: {idxMask}, {readIdxMask}, {fn}")
 
             if readIdxMask == idxMask:
                 maskFn = fn
                 break
 
         if not maskFn:
-            if self.verbose:
-                print(f"PathologySlice: Mask {idxMask} not found for slice {self.refSliceIdx}")
             return None
 
         try:
@@ -763,13 +915,13 @@ class PathologySlice:
             print(f"ERROR: Couldn't read mask {maskFn}: {e}")
             return None
 
-        # Handle multi-channel masks (fixed SimpleITK syntax)
+        # Handle multi-channel masks
         if im.GetNumberOfComponentsPerPixel() > 1:
             try:
                 select = sitk.VectorIndexSelectionCastImageFilter()
-                select.SetIndex(0)  # Select first channel
+                select.SetIndex(0)
                 im = select.Execute(im)
-                im = sitk.Cast(im, sitk.sitkUInt8)  # Ensure uint8 output
+                im = sitk.Cast(im, sitk.sitkUInt8)
             except Exception as e:
                 print(f"ERROR: Failed to process multi-channel mask: {e}")
                 return None
@@ -787,25 +939,19 @@ class PathologySlice:
             except Exception as e:
                 print(f"ERROR: Failed to flip mask: {e}")
 
-        if self.verbose:
-            print(f"PathologySlice: Reading mask {self.refSliceIdx} from '{maskFn}'")
-
         return im
-
-    def setReference(self, vol): 
-        """Set reference volume characteristics"""
+    
+    def setReference(self, vol):
+        """Set reference volume"""
         self.refSize = vol.GetSize()
         self.refSpacing = vol.GetSpacing()
         self.refOrigin = vol.GetOrigin()
         self.refDirection = vol.GetDirection()
-
-        # when setting a new reference, the Transform needs to be recomputed
         self.transform = None
-
+    
     def computeCenterTransform(self, im, ref, relativeIdx=0, mode=0, doRotate=None, transform_type=0):
-        """Compute center-based transform with improved error handling"""
+        """Compute center transform"""
         try:
-            # Convert to grayscale for transform computation
             if not mode:
                 im0 = self.getGrayFromRGB(im, invert=True)
                 if im0 is None:
@@ -816,8 +962,6 @@ class PathologySlice:
                     if ref0 is None:
                         ref0 = self.getGrayFromRGB(ref[:, :, max(0, self.refSliceIdx - 1)], invert=True)
                 except Exception as e:
-                    if self.verbose:
-                        print(f"Reference slice access error: {e}")
                     ref0 = self.getGrayFromRGB(ref[:, :, max(0, self.refSliceIdx - 1)], invert=True)
                     if ref0 is None:
                         return
@@ -826,14 +970,8 @@ class PathologySlice:
                 try:
                     ref0 = ref[:, :, self.refSliceIdx - relativeIdx]
                 except Exception as e:
-                    if self.verbose:
-                        print(f"Reference slice access error: {e}")
                     ref0 = ref[:, :, max(0, self.refSliceIdx - 1)]
-
-            if self.verbose:
-                print(f"Computing Center of mass for slice {self.refSliceIdx}, rotation: {doRotate}")
             
-            # Apply rotation first if needed
             if doRotate:
                 try:
                     center = ref0.TransformContinuousIndexToPhysicalPoint(
@@ -848,8 +986,6 @@ class PathologySlice:
                         
                     rotation.SetCenter(center)
                     self.transform = sitk.Transform(rotation)
-                    
-                    # Apply rotation to image
                     im0 = sitk.Resample(im0, ref0, self.transform)
                 except Exception as e:
                     print(f"ERROR: Failed to apply rotation: {e}")
@@ -857,23 +993,18 @@ class PathologySlice:
             else:
                 self.transform = None
                      
-            # Compute centering transform
             try:
                 tr = sitk.CenteredTransformInitializer(
                     ref0, im0, 
                     sitk.AffineTransform(im.GetDimension()), 
                     sitk.CenteredTransformInitializerFilter.MOMENTS)
                 transform = sitk.AffineTransform(tr)
-                if self.verbose:
-                    print("Using center of mass")
             except:
                 try:
                     tr = sitk.CenteredTransformInitializer(
                         ref0, im0, 
                         sitk.AffineTransform(im.GetDimension()), 
                         sitk.CenteredTransformInitializerFilter.GEOMETRY)
-                    if self.verbose:
-                        print("Using geometric center")
                     transform = sitk.AffineTransform(tr)
                 except Exception as e:
                     print(f"ERROR: Failed to compute center transform: {e}")
@@ -887,9 +1018,9 @@ class PathologySlice:
         except Exception as e:
             print(f"ERROR: Failed to compute center transform: {e}")
             self.transform = None
-
+    
     def setTransformedRgb(self, ref, relativeIdx):
-        """Set transformed RGB image into reference volume"""
+        """Set transformed RGB"""
         try:
             im = self.loadRgbImage()
             if not im:
@@ -908,8 +1039,6 @@ class PathologySlice:
                 ref = sitk.Paste(ref, ref_tr, ref_tr.GetSize(), 
                     destinationIndex=[0, 0, self.refSliceIdx])    
             except Exception as e:
-                if self.verbose:
-                    print(f"Slice index error, using fallback: {e}")
                 im_tr = sitk.Resample(im, ref[:, :, max(0, self.refSliceIdx - 1)], self.transform,
                     sitk.sitkNearestNeighbor, 255)
                 ref_tr = sitk.JoinSeries(im_tr)
@@ -921,9 +1050,9 @@ class PathologySlice:
         except Exception as e:
             print(f"ERROR: Failed to set transformed RGB: {e}")
             return ref
-
+    
     def setTransformedMask(self, ref, idxMask, relativeIdx):
-        """Set transformed mask into reference volume"""
+        """Set transformed mask with binary values (0 or 1)"""
         try:
             im = self.loadMask(idxMask)
             if not im:
@@ -943,8 +1072,6 @@ class PathologySlice:
                 ref = sitk.Paste(ref, ref_tr, ref_tr.GetSize(), 
                     destinationIndex=[0, 0, self.refSliceIdx])
             except Exception as e:
-                if self.verbose:
-                    print(f"Slice index error for mask, using fallback: {e}")
                 im_tr = sitk.Resample(im, ref[:, :, max(0, self.refSliceIdx - 1)], 
                         self.transform, 
                         sitk.sitkNearestNeighbor)
@@ -957,96 +1084,335 @@ class PathologySlice:
         except Exception as e:
             print(f"ERROR: Failed to set transformed mask: {e}")
             return ref
- 
-    def registerTo(self, refPs, ref, refMask, applyTransf2Ref=True, idx=0):
-        """Register this slice to reference slice (simplified for UI compatibility)"""
+    
+    def setTransformedMaskWithLabel(self, ref, idxMask, relativeIdx, label_value):
+        """
+        Set transformed mask WITH SPECIFIC LABEL VALUE
+        This creates a proper labelmap where each slice has its MRI label value
+        
+        Args:
+            ref: Reference volume (labelmap)
+            idxMask: Mask index to load
+            relativeIdx: Relative index
+            label_value: The MRI label value to assign to this slice
+        """
         try:
-            if applyTransf2Ref:
-                old = refPs.refSliceIdx
-                refPs.refSliceIdx = self.refSliceIdx
-                fixed_image = refPs.setTransformedRgb(ref, 1)[:, :, self.refSliceIdx]
-                refPs.refSliceIdx = old
-            else:
-                fixed_image = refPs.loadRgbImage()
-            
-            if not fixed_image:
-                print("ERROR: Failed to load fixed image for registration")
-                return
-            
-            fixed_image = self.getGrayFromRGB(fixed_image)
-            if not fixed_image:
-                print("ERROR: Failed to convert fixed image to grayscale")
-                return
+            im = self.loadMask(idxMask)
+            if not im:
+                return ref
+
+            if not self.transform:
+                self.computeCenterTransform(im, ref, relativeIdx, 1, self.doRotate)
                 
-            moving_image = self.loadRgbImage()
-            if not moving_image:
-                print("ERROR: Failed to load moving image for registration")
-                return
+            if not self.transform:
+                return ref
+
+            # Transform the mask
+            try:    
+                im_tr = sitk.Resample(im, ref[:, :, self.refSliceIdx], 
+                        self.transform, 
+                        sitk.sitkNearestNeighbor)
                 
-            moving_image = self.getGrayFromRGB(moving_image)
-            if not moving_image:
-                print("ERROR: Failed to convert moving image to grayscale")
-                return
+                # Convert binary mask to specific label value
+                im_tr_array = sitk.GetArrayFromImage(im_tr)
+                im_tr_labeled = np.where(im_tr_array > 0, label_value, 0).astype(np.uint16)
+                im_tr_labeled_sitk = sitk.GetImageFromArray(im_tr_labeled)
+                im_tr_labeled_sitk.CopyInformation(im_tr)
+                
+                ref_tr = sitk.JoinSeries(im_tr_labeled_sitk)
+                ref = sitk.Paste(ref, ref_tr, ref_tr.GetSize(), 
+                    destinationIndex=[0, 0, self.refSliceIdx])
+                    
+            except Exception as e:
+                im_tr = sitk.Resample(im, ref[:, :, max(0, self.refSliceIdx - 1)], 
+                        self.transform, 
+                        sitk.sitkNearestNeighbor)
+                
+                # Convert binary mask to specific label value
+                im_tr_array = sitk.GetArrayFromImage(im_tr)
+                im_tr_labeled = np.where(im_tr_array > 0, label_value, 0).astype(np.uint16)
+                im_tr_labeled_sitk = sitk.GetImageFromArray(im_tr_labeled)
+                im_tr_labeled_sitk.CopyInformation(im_tr)
+                
+                ref_tr = sitk.JoinSeries(im_tr_labeled_sitk)
+                ref = sitk.Paste(ref, ref_tr, ref_tr.GetSize(), 
+                    destinationIndex=[0, 0, max(0, self.refSliceIdx - 1)])
+                    
+            return ref
             
-            # Apply masks if available
+        except Exception as e:
+            print(f"ERROR: Failed to set transformed mask with label: {e}")
+            return ref
+
+    def registerToConstraintWithLabel(self, fixed_image, fixed_label_mask,
+                                  refMov, refMovMask, ref, refMask,
+                                  idx, target_label, applyTransf=True):
+        """
+        Register histology slice to MRI slice using specific label mask.
+        Uses a robust multi-stage approach with proper physical space handling.
+        
+        Args:
+            fixed_image: 2D MRI slice (fixed).
+            fixed_label_mask: 2D binary mask for target label.
+            refMov: Reference histology RGB volume.
+            refMovMask: Reference histology mask volume.
+            ref: Reference volume.
+            refMask: Reference mask.
+            idx: Z-index of target MRI slice.
+            target_label: MRI label value this slice should match.
+            applyTransf: Whether to apply transform.
+        """
+        if self.verbose:
+            print(f"\n  -> Registering to MRI label {target_label} (slice Z={idx})")
+
+        self.target_mri_label = target_label
+
+        try:
+            # --- PHASE 0: EXTRACT AND VALIDATE IMAGES ---
+            
+            # Fixed image (MRI) - ensure Float32 and valid spacing
+            fixed_gray = sitk.Cast(fixed_image, sitk.sitkFloat32)
+            fixed_mask_2d = sitk.Cast(fixed_label_mask, sitk.sitkUInt8)
+            
+            # Validate fixed image spacing
+            fixed_spacing = fixed_gray.GetSpacing()
+            if any(s <= 0 for s in fixed_spacing):
+                if self.verbose:
+                    print(f"     - Warning: Invalid fixed spacing {fixed_spacing}, using [1.0, 1.0]")
+                fixed_gray.SetSpacing([1.0, 1.0])
+                fixed_mask_2d.SetSpacing([1.0, 1.0])
+            
+            # Extract moving slice (histology)
             try:
-                if applyTransf2Ref:
-                    fixed_mask = refPs.setTransformedMask(refMask, 0, 1)[:, :, refPs.refSliceIdx]  
+                moving_rgb_slice = refMov[:, :, self.refSliceIdx]
+            except:
+                moving_rgb_slice = refMov[:, :, max(0, self.refSliceIdx - 1)]
+            
+            moving_gray_original = self.getGrayFromRGB(moving_rgb_slice, invert=True)
+            if moving_gray_original is None:
+                raise RuntimeError("Failed to convert histology to grayscale")
+            
+            moving_gray_original = sitk.Cast(moving_gray_original, sitk.sitkFloat32)
+            
+            # Validate and fix moving image spacing
+            moving_spacing = moving_gray_original.GetSpacing()
+            if any(s <= 0 for s in moving_spacing):
+                if self.verbose:
+                    print(f"     - Warning: Invalid moving spacing {moving_spacing}, using [1.0, 1.0]")
+                moving_gray_original.SetSpacing([1.0, 1.0])
+            
+            # Extract moving mask if available
+            moving_mask_original = None
+            if refMovMask is not None:
+                try:
+                    moving_mask_slice = refMovMask[:, :, self.refSliceIdx]
+                    moving_mask_original = sitk.Cast(moving_mask_slice, sitk.sitkUInt8)
+                    
+                    # Validate mask spacing
+                    mask_spacing = moving_mask_original.GetSpacing()
+                    if any(s <= 0 for s in mask_spacing):
+                        moving_mask_original.SetSpacing([1.0, 1.0])
+                except Exception as e:
+                    if self.verbose:
+                        print(f"     - Warning: Could not extract moving mask: {e}")
+                    moving_mask_original = None
+            
+            # --- PHASE 1: ROBUST INITIALIZATION ---
+            if self.verbose:
+                print("     - Phase 1: Computing initial alignment")
+            
+            # Strategy: Use GEOMETRY mode for initial alignment
+            # This aligns image centers and handles spacing differences
+            centering_transform = None
+            
+            try:
+                # Try GEOMETRY mode (aligns centers)
+                centering_transform = sitk.CenteredTransformInitializer(
+                    fixed_gray,
+                    moving_gray_original,
+                    sitk.Euler2DTransform(),  # Use simpler transform for initialization
+                    sitk.CenteredTransformInitializerFilter.GEOMETRY
+                )
+                if self.verbose:
+                    print("     - ✓ GEOMETRY initialization succeeded")
+            except Exception as e1:
+                if self.verbose:
+                    print(f"     - GEOMETRY mode failed: {e1}")
+                
+                try:
+                    # Fallback: MOMENTS mode (aligns intensity centroids)
+                    centering_transform = sitk.CenteredTransformInitializer(
+                        fixed_gray,
+                        moving_gray_original,
+                        sitk.Euler2DTransform(),
+                        sitk.CenteredTransformInitializerFilter.MOMENTS
+                    )
+                    if self.verbose:
+                        print("     - ✓ MOMENTS initialization succeeded")
+                except Exception as e2:
+                    if self.verbose:
+                        print(f"     - MOMENTS mode also failed: {e2}")
+                    
+                    # Last resort: Manual center alignment
+                    centering_transform = sitk.Euler2DTransform()
+                    centering_transform.SetIdentity()
+                    
+                    # Calculate translation to align centers
+                    fixed_center = fixed_gray.TransformContinuousIndexToPhysicalPoint(
+                        [s/2.0 for s in fixed_gray.GetSize()]
+                    )
+                    moving_center = moving_gray_original.TransformContinuousIndexToPhysicalPoint(
+                        [s/2.0 for s in moving_gray_original.GetSize()]
+                    )
+                    
+                    translation = [fixed_center[i] - moving_center[i] for i in range(2)]
+                    centering_transform.SetTranslation(translation)
+                    
+                    if self.verbose:
+                        print(f"     - ✓ Manual center alignment: translation={translation}")
+            
+            # --- PHASE 2: APPLY CENTERING AND VALIDATE OVERLAP ---
+            if self.verbose:
+                print("     - Phase 2: Applying initial alignment")
+            
+            # Apply centering to moving image
+            resampler = sitk.ResampleImageFilter()
+            resampler.SetReferenceImage(fixed_gray)
+            resampler.SetTransform(centering_transform)
+            resampler.SetInterpolator(sitk.sitkLinear)
+            resampler.SetDefaultPixelValue(0)
+            
+            moving_gray_centered = resampler.Execute(moving_gray_original)
+            
+            # Apply to mask if available
+            moving_mask_centered = None
+            if moving_mask_original:
+                resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+                moving_mask_centered = resampler.Execute(moving_mask_original)
+            
+            # Validate overlap
+            moving_stats = sitk.StatisticsImageFilter()
+            moving_stats.Execute(moving_gray_centered)
+            
+            if moving_stats.GetSum() == 0:
+                if self.verbose:
+                    print("     - Warning: No overlap after centering, using identity transform")
+                self.transform = sitk.Transform(2, sitk.sitkIdentity)
+                return
+            
+            # --- PHASE 3: AFFINE REGISTRATION ---
+            if self.verbose:
+                print("     - Phase 3: Affine registration")
+            
+            # Check if masks have sufficient content
+            use_masks = True
+            if fixed_mask_2d is not None:
+                mask_stats = sitk.StatisticsImageFilter()
+                mask_stats.Execute(fixed_mask_2d)
+                if mask_stats.GetSum() < 10:  # Need at least 10 pixels
+                    use_masks = False
+                    if self.verbose:
+                        print("     - Warning: Fixed mask too small, registering without masks")
+            
+            if moving_mask_centered is not None:
+                mask_stats = sitk.StatisticsImageFilter()
+                mask_stats.Execute(moving_mask_centered)
+                if mask_stats.GetSum() < 10:
+                    use_masks = False
+                    if self.verbose:
+                        print("     - Warning: Moving mask too small, registering without masks")
+            
+            # Setup registration
+            reg = RegisterImages()
+            reg.verbose = False  # Reduce noise
+            n_iterations_affine = 50 if self.fastExecution else 200
+            
+            # Use identity as initial transform for refinement
+            identity_transform = sitk.AffineTransform(2)
+            identity_transform.SetIdentity()
+            
+            try:
+                if use_masks and fixed_mask_2d is not None and moving_mask_centered is not None:
+                    affine_refinement = reg.RegisterAffineWithMasks(
+                        fixed_img=fixed_gray,
+                        moving_img=moving_gray_centered,
+                        fixed_mask=fixed_mask_2d,
+                        moving_mask=moving_mask_centered,
+                        initial_transf=identity_transform,
+                        n_iterations=n_iterations_affine,
+                        mode=0,
+                        mode_score=1
+                    )
                 else:
-                    fixed_mask = refPs.loadMask(0)
+                    # Register without masks
+                    affine_refinement = reg.RegisterAffineWithMasks(
+                        fixed_img=fixed_gray,
+                        moving_img=moving_gray_centered,
+                        fixed_mask=None,
+                        moving_mask=None,
+                        initial_transf=identity_transform,
+                        n_iterations=n_iterations_affine,
+                        mode=0,
+                        mode_score=1
+                    )
+                
+                # Compose transforms
+                final_affine = sitk.CompositeTransform([centering_transform, affine_refinement])
+                
+                if self.verbose:
+                    print("     - ✓ Affine registration succeeded")
+            
             except Exception as e:
                 if self.verbose:
-                    print("No mask 0 was found for fixed image")
-                fixed_mask = None
-             
-            if fixed_mask:
-                try:
-                    fixed_mask = sitk.Cast(sitk.Resample(fixed_mask, fixed_image, sitk.Transform(), 
-                        sitk.sitkNearestNeighbor, 0.0, fixed_image.GetPixelID()) > 0,
-                        fixed_image.GetPixelID())
-                    fixed_image = fixed_image * fixed_mask
-                except Exception as e:
-                    if self.verbose:
-                        print(f"Failed to apply fixed mask: {e}")
-                        
-            # Apply mask to moving image
-            try:
-                moving_mask = self.loadMask(0)
-            except Exception as e:
+                    print(f"     - Affine registration failed: {e}")
+                # Use only centering transform
+                final_affine = centering_transform
+            
+            final_transform = final_affine
+            
+            # --- PHASE 4: DEFORMABLE REGISTRATION (if requested) ---
+            if self.doDeformable:
                 if self.verbose:
-                    print("No mask 0 was found for moving image")
-                moving_mask = None
-             
-            if moving_mask:
+                    print("     - Phase 4: Deformable registration")
+                
                 try:
-                    moving_mask = sitk.Cast(sitk.Resample(moving_mask, moving_image, sitk.Transform(), 
-                        sitk.sitkNearestNeighbor, 0.0, moving_image.GetPixelID()) > 0,
-                        moving_image.GetPixelID())
-                    moving_image = moving_image * moving_mask
+                    n_iterations_deformable = 5 if self.fastExecution else 15
+                    grid_spacing = 25 if self.fastExecution else 15
+                    
+                    deformable_transform = reg.RegisterDeformable(
+                        fixed_img=fixed_gray,
+                        moving_img=moving_gray_original,
+                        initial_transf=final_affine,
+                        dist_between_grid_points=grid_spacing,
+                        n_iterations=n_iterations_deformable
+                    )
+                    
+                    final_transform = sitk.CompositeTransform([final_affine, deformable_transform])
+                    
+                    if self.verbose:
+                        print("     - ✓ Deformable registration succeeded")
+                
                 except Exception as e:
                     if self.verbose:
-                        print(f"Failed to apply moving mask: {e}")
+                        print(f"     - Deformable registration failed: {e}")
+                    # Keep affine-only result
+            
+            # --- STORE RESULT ---
+            self.transform = final_transform
             
             if self.verbose:
-                print(f"PathologySlice: Registration - affine: {self.doAffine}, deformable: {self.doDeformable}")
-            
-            nIter = 500 if self.runLonger else 250
-            
-            # Simplified registration - would need RegisterImages class for full implementation
-            if self.doAffine:
-                print(f"Would perform affine registration with {nIter} iterations")
-                # reg = RegisterImages()
-                # self.transform = reg.RegisterAffine(fixed_image, moving_image, self.transform, nIter, idx, 1)
-                
+                print(f"  -> ✓ Registration completed for label {target_label}")
+        
         except Exception as e:
-            print(f"ERROR: Registration failed: {e}")
+            print(f"  -> ❌ ERROR during registration for slice {self.refSliceIdx} "
+                f"(label {target_label}): {e}")
+            # Use identity transform to avoid blocking process
+            self.transform = sitk.Transform(2, sitk.sitkIdentity)
             
-    def registerToConstraint(self, fixed_image, refMov, refMovMask, ref, refMask, idx, applyTransf=True):  
-        """Register to constraint (simplified for UI compatibility)"""
-        print(f"Constraint registration for slice {idx} - simplified implementation")
-        # This would require full RegisterImages implementation
-        pass
-
+            if self.verbose:
+                import traceback
+                traceback.print_exc()
+    
     def deleteData(self):
         """Clean up slice data"""
         if self.verbose:
